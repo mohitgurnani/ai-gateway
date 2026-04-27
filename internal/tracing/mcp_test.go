@@ -687,6 +687,155 @@ func TestTracer_StartSpanAndInjectMeta_TruncatesOversizeBeforePromotion(t *testi
 	}
 }
 
+// TestTracer_StartSpanAndInjectMeta_AuthKindBaggage asserts that when a
+// client sets baggage `user`, the span carries `auth.kind=baggage` and
+// does NOT emit a `client.address` (the request had no peer address in
+// this unit test) or an `ip:*` user.id fallback. This is the
+// "trusted-identity" case.
+//
+// Phase B TODO: this test stays valid after Okta rollout, but
+// `auth.kind=baggage` becomes the legacy fallback once `auth.kind=okta`
+// becomes the trusted-identity case. See
+// `docs/telemetry-rollout-tracker.md`.
+func TestTracer_StartSpanAndInjectMeta_AuthKindBaggage(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	headers := http.Header{}
+	headers.Set("baggage", "user=alice%40example.com")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+	require.Contains(t, attrs, attribute.String("auth.kind", "baggage"))
+	require.Contains(t, attrs, attribute.String("user.id", "alice@example.com"))
+	for _, a := range attrs {
+		require.NotEqual(t, attribute.Key("client.address"), a.Key,
+			"client.address must not be set when context has no client addr")
+		// user.id must be exactly the baggage value, never the
+		// "ip:<addr>" fallback.
+		if a.Key == "user.id" {
+			require.False(t, strings.HasPrefix(a.Value.AsString(), "ip:"),
+				"user.id must come from baggage, not the IP fallback")
+		}
+	}
+}
+
+// TestTracer_StartSpanAndInjectMeta_AuthKindIP asserts that when no
+// baggage `user` is set but the request context carries a captured
+// client address, the span:
+//   - carries `auth.kind=ip`,
+//   - falls user.id back to "ip:<addr>" so per-user dashboards still
+//     bucket the call,
+//   - emits `client.address` and `client.address.kind`.
+//
+// Phase B TODO: deleted once Okta-derived identity is the trusted source
+// for user.id. See `docs/telemetry-rollout-tracker.md` "Phase A vs Phase B".
+func TestTracer_StartSpanAndInjectMeta_AuthKindIP(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	ctx := WithClientAddr(context.Background(), "10.113.24.55", "remote_addr")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(ctx, r, p, http.Header{})
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+	require.Contains(t, attrs, attribute.String("auth.kind", "ip"))
+	require.Contains(t, attrs, attribute.String("user.id", "ip:10.113.24.55"))
+	require.Contains(t, attrs, attribute.String("client.address", "10.113.24.55"))
+	require.Contains(t, attrs, attribute.String("client.address.kind", "remote_addr"))
+}
+
+// TestTracer_StartSpanAndInjectMeta_AuthKindAnonymous asserts that when
+// neither baggage `user` nor a captured client address is available, the
+// span carries `auth.kind=anonymous`, no `user.id`, and no
+// `client.address`. Anonymous spans must still be exportable -- this
+// test guards against regressions where a missing identity throws or
+// emits empty-string attributes.
+func TestTracer_StartSpanAndInjectMeta_AuthKindAnonymous(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, http.Header{})
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+	require.Contains(t, attrs, attribute.String("auth.kind", "anonymous"))
+	for _, a := range attrs {
+		require.NotEqual(t, attribute.Key("user.id"), a.Key,
+			"anonymous spans must not emit user.id at all")
+		require.NotEqual(t, attribute.Key("client.address"), a.Key)
+		require.NotEqual(t, attribute.Key("client.address.kind"), a.Key)
+	}
+}
+
+// TestTracer_StartSpanAndInjectMeta_BaggageBeatsIP asserts the precedence
+// rule: if both baggage `user` AND a captured client address are
+// present, the span's `auth.kind` is "baggage" (the trusted source) and
+// `user.id` is the baggage value, not the IP. The IP is still recorded
+// as `client.address` for audit so dashboards can break down a single
+// baggage user across source IPs.
+func TestTracer_StartSpanAndInjectMeta_BaggageBeatsIP(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	ctx := WithClientAddr(context.Background(), "10.113.24.55", "remote_addr")
+	headers := http.Header{}
+	headers.Set("baggage", "user=alice%40example.com")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(ctx, r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+	require.Contains(t, attrs, attribute.String("auth.kind", "baggage"))
+	require.Contains(t, attrs, attribute.String("user.id", "alice@example.com"))
+	// client.address still recorded for audit, even when baggage wins.
+	require.Contains(t, attrs, attribute.String("client.address", "10.113.24.55"))
+
+	// Specifically, user.id must NOT have been overwritten with the IP
+	// fallback. Walking attrs because there can only be one user.id.
+	for _, a := range attrs {
+		if a.Key == "user.id" {
+			require.Equal(t, "alice@example.com", a.Value.AsString(),
+				"baggage user must win over IP fallback for user.id")
+		}
+	}
+}
+
 // TestRecordRouteToBackend_SetsBackendAttribute asserts that the
 // backend name written by [mcpSpan.RecordRouteToBackend] is surfaced as a
 // queryable span attribute (`mcp.backend.name`) and as a `langfuse.tags`

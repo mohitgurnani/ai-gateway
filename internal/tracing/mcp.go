@@ -348,7 +348,10 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 	//   * baggage `role`   -> entry in `langfuse.tags`   ("role:<value>")
 	// The original `mcp.client.*` attributes are preserved unchanged so
 	// non-Langfuse consumers that already query them keep working.
-	var tags []string
+	var (
+		tags           []string
+		hasBaggageUser bool
+	)
 	if bag := baggage.FromContext(parentCtx); bag.Len() > 0 {
 		for key, attrKey := range m.baggageAttrs {
 			member := bag.Member(key)
@@ -364,6 +367,7 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 			switch key {
 			case "user":
 				attrs = append(attrs, attribute.String("user.id", truncated))
+				hasBaggageUser = true
 			case "ticket":
 				tags = append(tags, "ticket:"+truncated)
 			case "role":
@@ -373,6 +377,55 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 	}
 	if len(tags) > 0 {
 		attrs = append(attrs, attribute.StringSlice("langfuse.tags", tags))
+	}
+
+	// Phase A — client-network identity capture + auth.kind attribution.
+	//
+	// When the client did not set baggage `user`, we still want operators
+	// to be able to bucket / filter / rate-limit by caller, so we stuff
+	// "ip:<addr>" into the Langfuse-native `user.id` dimension. We also
+	// always emit `auth.kind` so dashboards can tell trusted-identity
+	// calls (`baggage` -- and in Phase B, `okta`) apart from the
+	// fallback-identity ones (`ip` / `anonymous`). The raw client
+	// address is additionally surfaced under `client.address` (with
+	// `client.address.kind` recording whether it came from the immediate
+	// peer or a trusted-proxy XFF) so audit / volume queries can
+	// distinguish callers that share a baggage `user` value.
+	//
+	// PII contract: `client.address` is a private RFC1918 IP for the
+	// internal-only deployment of this gateway; we explicitly accept
+	// recording it. If this gateway is ever exposed to non-internal
+	// callers, scrub `client.address` and any `user.id = "ip:*"` value
+	// at the OTel Collector before the data reaches Langfuse.
+	//
+	// Phase B TODO: this entire block (`client.address*` attributes,
+	// the `auth.kind in {ip, anonymous}` branches, and the
+	// `user.id = "ip:<addr>"` fallback) goes away once Okta/JWT verifies
+	// the user. `auth.kind` becomes "okta" / "baggage" / "anonymous";
+	// `user.id` is sourced from the verified principal; the IP is at
+	// most an audit-only attribute. The [PickClientAddr] helper and the
+	// [MCPTrustedProxyCIDRsEnv] env knob in
+	// `internal/tracing/clientaddr.go` are removed in the same change.
+	// See `docs/telemetry-rollout-tracker.md` "Phase A vs Phase B".
+	clientAddr, addrKind, _ := clientAddrFromContext(ctx)
+	authKind := "anonymous"
+	switch {
+	case hasBaggageUser:
+		authKind = "baggage"
+	case clientAddr != "":
+		authKind = "ip"
+		// Fallback so existing per-user dashboards still bucket
+		// untagged callers. Prefixed with "ip:" so it is impossible
+		// to confuse with a baggage-supplied user value (which is
+		// expected to be a username/email, never an IP literal).
+		attrs = append(attrs, attribute.String("user.id", "ip:"+clientAddr))
+	}
+	attrs = append(attrs, attribute.String("auth.kind", authKind))
+	if clientAddr != "" {
+		attrs = append(attrs,
+			attribute.String("client.address", clientAddr),
+			attribute.String("client.address.kind", addrKind),
+		)
 	}
 
 	// Start the span with options appropriate for the semantic convention.

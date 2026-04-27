@@ -31,6 +31,7 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
 	"github.com/envoyproxy/ai-gateway/internal/metrics"
+	"github.com/envoyproxy/ai-gateway/internal/tracing"
 	"github.com/envoyproxy/ai-gateway/internal/tracing/tracingapi"
 	"github.com/envoyproxy/ai-gateway/internal/version"
 )
@@ -199,6 +200,22 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 		applicationError bool
 		result           handlerResult
 	)
+	// Phase A — capture client-network identity (X-Forwarded-For if the
+	// immediate peer is in MCP_TRUSTED_PROXY_CIDRS, otherwise
+	// r.RemoteAddr) onto the request context so the tracing layer can
+	// emit `client.address`, `client.address.kind`, and a fallback
+	// `user.id = "ip:<addr>"` for callers that did not set baggage
+	// `user`. We do this once at the top of the request so every span
+	// kicked off during this handler invocation sees the same value
+	// without re-parsing the request.
+	//
+	// Phase B TODO: remove once Okta-verified identity is the trusted
+	// source for `user.id` and `auth.kind`. See
+	// internal/tracing/clientaddr.go and
+	// docs/telemetry-rollout-tracker.md.
+	if addr, kind := tracing.PickClientAddr(r); kind != "" {
+		ctx = tracing.WithClientAddr(ctx, addr, kind)
+	}
 	defer func() {
 		if m.l.Enabled(ctx, slog.LevelDebug) {
 			m.l.Debug("Completed MCP POST request",
