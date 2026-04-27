@@ -106,12 +106,40 @@ var _ tracingapi.MCPSpan = (*mcpSpan)(nil)
 var _ tracingapi.MCPTracer = (*mcpTracer)(nil)
 
 // mcpSpan is an implementation of [tracingapi.MCPSpan].
+//
+// tags accumulates entries written under the `langfuse.tags` attribute.
+// The Langfuse OTLP receiver promotes that attribute to its native "tags"
+// dimension which is filterable / groupable from dashboards. Because OTel
+// `SetAttributes` overwrites a key on each call rather than appending,
+// callers that emit tags across multiple calls (start + RecordRouteToBackend
+// etc.) must go through [mcpSpan.appendTags] so the merged slice is rewritten
+// each time and earlier tags are not lost.
 type mcpSpan struct {
 	span trace.Span
+	tags []string
+}
+
+// appendTags appends new entries to [mcpSpan.tags] and re-sets the
+// `langfuse.tags` attribute with the merged list. No-op if extras is
+// empty so we never set an empty slice on the span.
+func (s *mcpSpan) appendTags(extras ...string) {
+	if len(extras) == 0 {
+		return
+	}
+	s.tags = append(s.tags, extras...)
+	s.span.SetAttributes(attribute.StringSlice("langfuse.tags", s.tags))
 }
 
 // RecordRouteToBackend implements [tracingapi.MCPSpan.RecordRouteToBackend].
-func (s mcpSpan) RecordRouteToBackend(backend string, sessionID string, isNew bool) {
+//
+// Surfaces the backend name as both a queryable span attribute
+// (`mcp.backend.name`) and a `langfuse.tags` entry (`backend:<name>`).
+// Backend-as-tag enables dashboard group-bys (Langfuse dashboards group on
+// tags but not on arbitrary OTel attributes); backend-as-attribute keeps
+// the canonical OTel-MCP key available for non-Langfuse consumers.
+func (s *mcpSpan) RecordRouteToBackend(backend string, sessionID string, isNew bool) {
+	s.span.SetAttributes(attribute.String("mcp.backend.name", backend))
+	s.appendTags("backend:" + backend)
 	s.span.AddEvent("route to backend", trace.WithAttributes(
 		attribute.String("mcp.backend.name", backend),
 		attribute.String("mcp.session.id", sessionID),
@@ -120,7 +148,7 @@ func (s mcpSpan) RecordRouteToBackend(backend string, sessionID string, isNew bo
 }
 
 // EndSpanOnError implements [tracingapi.MCPSpan.EndSpanOnError].
-func (s mcpSpan) EndSpanOnError(errType string, err error) {
+func (s *mcpSpan) EndSpanOnError(errType string, err error) {
 	s.span.AddEvent("exception", trace.WithAttributes(
 		attribute.String("exception.type", errType),
 		attribute.String("exception.message", err.Error()),
@@ -130,7 +158,7 @@ func (s mcpSpan) EndSpanOnError(errType string, err error) {
 }
 
 // EndSpan implements [tracingapi.MCPSpan.EndSpan].
-func (s mcpSpan) EndSpan() {
+func (s *mcpSpan) EndSpan() {
 	s.span.SetStatus(codes.Ok, "")
 	s.span.End()
 }
@@ -233,6 +261,18 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 	// does not create a span attribute that is impossible to query on.
 	// Oversized values are truncated to [maxBaggageAttrValueBytes] so a
 	// misbehaving client cannot inflate span export payloads.
+	//
+	// Three of the default baggage keys are additionally promoted to
+	// Langfuse-native dimensions so they become directly filterable /
+	// groupable in dashboards (Langfuse only indexes a fixed whitelist of
+	// top-level keys -- arbitrary `mcp.client.*` attributes are not
+	// queryable from the dashboard UI):
+	//   * baggage `user`   -> attribute `user.id`        (Langfuse `userId`)
+	//   * baggage `ticket` -> entry in `langfuse.tags`   ("ticket:<value>")
+	//   * baggage `role`   -> entry in `langfuse.tags`   ("role:<value>")
+	// The original `mcp.client.*` attributes are preserved unchanged so
+	// non-Langfuse consumers that already query them keep working.
+	var tags []string
 	if bag := baggage.FromContext(parentCtx); bag.Len() > 0 {
 		for key, attrKey := range m.baggageAttrs {
 			member := bag.Member(key)
@@ -243,8 +283,20 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 			if value == "" {
 				continue
 			}
-			attrs = append(attrs, attribute.String(attrKey, truncateBaggageAttrValue(value)))
+			truncated := truncateBaggageAttrValue(value)
+			attrs = append(attrs, attribute.String(attrKey, truncated))
+			switch key {
+			case "user":
+				attrs = append(attrs, attribute.String("user.id", truncated))
+			case "ticket":
+				tags = append(tags, "ticket:"+truncated)
+			case "role":
+				tags = append(tags, "role:"+truncated)
+			}
 		}
+	}
+	if len(tags) > 0 {
+		attrs = append(attrs, attribute.StringSlice("langfuse.tags", tags))
 	}
 
 	// Start the span with options appropriate for the semantic convention.
@@ -267,7 +319,7 @@ func (m mcpTracer) StartSpanAndInjectMeta(ctx context.Context, req *jsonrpc.Requ
 	// Only record request attributes if span is recording (sampled).
 	if span.IsRecording() {
 		span.SetAttributes(attrs...)
-		return &mcpSpan{span: span}
+		return &mcpSpan{span: span, tags: tags}
 	}
 
 	return nil
@@ -302,7 +354,16 @@ func getMCPParamsAsAttributes(p mcp.Params) []attribute.KeyValue {
 			)
 		}
 	case *mcp.CallToolParams:
-		attrs = append(attrs, attribute.String("mcp.tool.name", params.Name))
+		// Dual-emit: `mcp.tool.name` is the canonical OTel-MCP key used by
+		// the rest of this codebase and tests; `tool.name` is the
+		// OpenInference / Langfuse semantic-conventions key that Langfuse
+		// indexes as the dashboard "Tool Names" dimension. Writing both
+		// preserves the original contract while unlocking native dashboard
+		// group-by on tool name.
+		attrs = append(attrs,
+			attribute.String("mcp.tool.name", params.Name),
+			attribute.String("tool.name", params.Name),
+		)
 	case *mcp.GetPromptParams:
 		attrs = append(attrs, attribute.String("mcp.prompt.name", params.Name))
 	case *mcp.SetLoggingLevelParams:

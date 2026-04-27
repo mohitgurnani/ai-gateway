@@ -335,6 +335,7 @@ func Test_getMCPAttributes(t *testing.T) {
 			},
 			expected: []attribute.KeyValue{
 				attribute.String("mcp.tool.name", "fake-tool"),
+				attribute.String("tool.name", "fake-tool"),
 			},
 		},
 		{
@@ -520,4 +521,178 @@ func TestMCPTracer_SpanName(t *testing.T) {
 			require.Equal(t, oteltrace.SpanKindClient, actualSpan.SpanKind)
 		})
 	}
+}
+
+// TestTracer_StartSpanAndInjectMeta_PromotesUserToLangfuse asserts that a
+// `user` baggage member is surfaced both under the existing `mcp.client.user`
+// attribute (back-compat for non-Langfuse consumers) and under the
+// Langfuse-native `user.id` attribute, which Langfuse indexes as the
+// dashboard "User ID" dimension. Both attributes must carry the same value.
+func TestTracer_StartSpanAndInjectMeta_PromotesUserToLangfuse(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	headers := http.Header{}
+	headers.Set("baggage", "user=alice%40example.com")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+	require.Contains(t, attrs, attribute.String("mcp.client.user", "alice@example.com"))
+	require.Contains(t, attrs, attribute.String("user.id", "alice@example.com"))
+}
+
+// TestTracer_StartSpanAndInjectMeta_PromotesTicketAndRoleToTags asserts
+// that `ticket` and `role` baggage members are surfaced as entries in the
+// Langfuse-native `langfuse.tags` slice attribute (Langfuse indexes that
+// list as the dashboard "Tags" dimension, which supports group-by). The
+// existing `mcp.client.*` attributes must remain so non-Langfuse queries
+// keep working.
+func TestTracer_StartSpanAndInjectMeta_PromotesTicketAndRoleToTags(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	headers := http.Header{}
+	headers.Set("baggage", "ticket=ENG-1,role=oncall,user=alice")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+
+	// mcp.client.* contract preserved.
+	require.Contains(t, attrs, attribute.String("mcp.client.ticket", "ENG-1"))
+	require.Contains(t, attrs, attribute.String("mcp.client.role", "oncall"))
+
+	// Find langfuse.tags and assert ticket: and role: entries are present.
+	// Order-insensitive because we iterate over the baggage map.
+	var tags []string
+	var found bool
+	for _, a := range attrs {
+		if a.Key == "langfuse.tags" {
+			tags = a.Value.AsStringSlice()
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "expected langfuse.tags attribute on span")
+	require.Contains(t, tags, "ticket:ENG-1")
+	require.Contains(t, tags, "role:oncall")
+	// `user` must NOT leak into tags -- it has its own native dimension.
+	for _, tag := range tags {
+		require.False(t, strings.HasPrefix(tag, "user:"),
+			"user baggage must be promoted to user.id, not langfuse.tags")
+	}
+}
+
+// TestTracer_StartSpanAndInjectMeta_TruncatesOversizeBeforePromotion
+// asserts that the [maxBaggageAttrValueBytes] cap applies BEFORE the
+// Langfuse-native promotions, so a misbehaving client cannot inflate the
+// `user.id` or `langfuse.tags` payloads any more than `mcp.client.*`.
+func TestTracer_StartSpanAndInjectMeta_TruncatesOversizeBeforePromotion(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	big := strings.Repeat("u", 512)
+	headers := http.Header{}
+	headers.Set("baggage", "user="+big+",ticket="+big)
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/list"}
+	p := &mcp.ListToolsParams{}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+
+	maxLen := maxBaggageAttrValueBytes + len("...")
+	for _, a := range attrs {
+		switch a.Key {
+		case "user.id", "mcp.client.user", "mcp.client.ticket":
+			require.LessOrEqual(t, len(a.Value.AsString()), maxLen,
+				"%s must be truncated to %d bytes", a.Key, maxLen)
+			require.True(t, strings.HasSuffix(a.Value.AsString(), "..."),
+				"%s must carry an ellipsis marker after truncation", a.Key)
+		case "langfuse.tags":
+			for _, tag := range a.Value.AsStringSlice() {
+				if strings.HasPrefix(tag, "ticket:") {
+					require.LessOrEqual(t, len(tag), maxLen+len("ticket:"),
+						"langfuse.tags ticket entry must use the truncated value")
+					require.True(t, strings.HasSuffix(tag, "..."),
+						"truncated ticket tag must carry the ellipsis marker")
+				}
+			}
+		}
+	}
+}
+
+// TestRecordRouteToBackend_SetsBackendAttribute asserts that the
+// backend name written by [mcpSpan.RecordRouteToBackend] is surfaced as a
+// queryable span attribute (`mcp.backend.name`) and as a `langfuse.tags`
+// entry (`backend:<name>`) -- not just as a span event. Span events are
+// not indexed by Langfuse dashboards, so without this promotion the
+// backend would be invisible to dashboard group-bys.
+func TestRecordRouteToBackend_SetsBackendAttribute(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	headers := http.Header{}
+	headers.Set("baggage", "ticket=ENG-1")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/call"}
+	p := &mcp.CallToolParams{Name: "nurag.query"}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.RecordRouteToBackend("nurag", "sess-abc", true)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+
+	// Backend appears as a top-level attribute (filterable in any OTLP
+	// backend) and inside langfuse.tags (groupable in Langfuse dashboards).
+	require.Contains(t, attrs, attribute.String("mcp.backend.name", "nurag"))
+
+	var tags []string
+	for _, a := range attrs {
+		if a.Key == "langfuse.tags" {
+			tags = a.Value.AsStringSlice()
+			break
+		}
+	}
+	require.Contains(t, tags, "backend:nurag")
+	// Earlier tags from baggage promotion must NOT be lost when
+	// RecordRouteToBackend re-sets langfuse.tags. This catches the
+	// "SetAttributes overwrites a key" footgun.
+	require.Contains(t, tags, "ticket:ENG-1")
+
+	// The existing span event contract is preserved for legacy consumers.
+	require.Len(t, spans[0].Events, 1)
+	require.Equal(t, "route to backend", spans[0].Events[0].Name)
 }
