@@ -366,6 +366,13 @@ func Test_getMCPAttributes(t *testing.T) {
 			},
 			expected: []attribute.KeyValue{
 				attribute.String("mcp.resource.uri", "fake-uri"),
+				// ReadResource encodes the URI as the request input
+				// under the Langfuse / OpenInference dual keys so the
+				// resource being read shows up in the trace's "Input"
+				// panel. See getMCPParamsAsAttributes.
+				attribute.String("langfuse.observation.input", `{"uri":"fake-uri"}`),
+				attribute.String("input.value", `{"uri":"fake-uri"}`),
+				attribute.String("input.mime_type", "application/json"),
 			},
 		},
 		{
@@ -409,6 +416,38 @@ func Test_getMCPAttributes(t *testing.T) {
 			expected: []attribute.KeyValue{
 				attribute.String("mcp.complete.argument.name", "fake-name"),
 				attribute.String("mcp.complete.argument.value", "fake-value"),
+			},
+		},
+		// CallTool with arguments: arguments must be promoted to the
+		// Langfuse / OpenInference input keys so the trace UI's Input
+		// panel renders the actual arguments instead of being empty.
+		// json.Marshal on a *RawMessage emits the underlying JSON, so
+		// we use a RawMessage-shaped argument map for the canonical
+		// JSON ordering the proxy will see at runtime.
+		{
+			p: &mcp.CallToolParams{
+				Name:      "fake-tool",
+				Arguments: map[string]any{"a": 1, "b": "x"},
+			},
+			expected: []attribute.KeyValue{
+				attribute.String("mcp.tool.name", "fake-tool"),
+				attribute.String("tool.name", "fake-tool"),
+				attribute.String("langfuse.observation.input", `{"a":1,"b":"x"}`),
+				attribute.String("input.value", `{"a":1,"b":"x"}`),
+				attribute.String("input.mime_type", "application/json"),
+			},
+		},
+		// GetPrompt with arguments: same dual-emit contract as CallTool.
+		{
+			p: &mcp.GetPromptParams{
+				Name:      "fake-prompt",
+				Arguments: map[string]string{"k": "v"},
+			},
+			expected: []attribute.KeyValue{
+				attribute.String("mcp.prompt.name", "fake-prompt"),
+				attribute.String("langfuse.observation.input", `{"k":"v"}`),
+				attribute.String("input.value", `{"k":"v"}`),
+				attribute.String("input.mime_type", "application/json"),
 			},
 		},
 	}

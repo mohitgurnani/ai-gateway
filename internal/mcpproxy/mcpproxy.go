@@ -50,6 +50,19 @@ type mcpRequestContext struct {
 	reqScopeFilterStatus  FilterStatus
 	reqScopeFilterRoute   filterapi.MCPRouteName
 	reqScopeFilterBackend filterapi.MCPBackendName
+
+	// currentSpan is the OTel/MCP span owned by this request, populated
+	// by parseParamsAndMaybeStartSpan (see handlers.go) when tracing is
+	// enabled and the request's JSON-RPC method has a registered span
+	// shape. We stash it on the request context so that the response
+	// path (proxyResponseBody) can record the upstream `result` payload
+	// onto the span as `langfuse.observation.output` / `output.value`
+	// before the span is ended in the servePOST defer block. Storing
+	// the interface on the per-request struct (rather than threading
+	// it through every helper) keeps the response-side hook a single
+	// nil-safe call without churning function signatures across the
+	// proxy. Nil is the no-tracing / non-instrumented-method case.
+	currentSpan tracingapi.MCPSpan
 }
 
 // NewMCPProxy creates a new MCPProxy instance.

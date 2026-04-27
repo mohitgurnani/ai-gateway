@@ -7,6 +7,7 @@ package tracing
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -23,6 +24,39 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/lang"
 	"github.com/envoyproxy/ai-gateway/internal/tracing/tracingapi"
 )
+
+// maxIOPayloadBytes caps how many bytes of MCP request input or response
+// output we copy onto a span. MCP tool inputs / outputs can be arbitrary
+// JSON of unbounded size (especially diagnostic / logs MCP backends that
+// echo huge payloads), and OTLP exporters and downstream backends often
+// reject or silently drop attributes above a few hundred KB. 8 KB is
+// chosen as a pragmatic balance: large enough to fit typical tool
+// arguments and short tool replies in full, small enough that even a
+// burst of pathological large-payload calls cannot inflate export size
+// to the point of dropping spans. The cap is byte-based and matches
+// what most LLM observability backends recommend for input/output
+// dimensions.
+const maxIOPayloadBytes = 8 * 1024
+
+// truncateForIOAttr truncates a byte slice for use as an input/output
+// attribute on a span. Returns the input as a string when it is at or
+// below the cap; otherwise returns the prefix up to the cap with a
+// "...[truncated]" marker appended so the consumer can see the value
+// was clipped. Truncation is byte-based; callers must be OK with
+// possibly cutting in the middle of a UTF-8 rune, since MCP results
+// are always JSON and JSON is ASCII-safe at structural boundaries --
+// the marker makes the truncation visible to humans inspecting the
+// span. Returns "" for empty / nil input so we never emit a span
+// attribute that is impossible to query on.
+func truncateForIOAttr(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	if len(b) <= maxIOPayloadBytes {
+		return string(b)
+	}
+	return string(b[:maxIOPayloadBytes]) + "...[truncated]"
+}
 
 // defaultBaggageSpanAttributes maps well-known W3C baggage keys (set by
 // clients on inbound HTTP requests per the client contract) to OTel span
@@ -114,9 +148,16 @@ var _ tracingapi.MCPTracer = (*mcpTracer)(nil)
 // callers that emit tags across multiple calls (start + RecordRouteToBackend
 // etc.) must go through [mcpSpan.appendTags] so the merged slice is rewritten
 // each time and earlier tags are not lost.
+//
+// outputRecorded guards [mcpSpan.RecordResponseOutput] so the proxy
+// response paths that may decode and emit the same response twice
+// (application/json fast path AND SSE fallback for the same payload)
+// only set the output-related attributes once. Idempotency keeps the
+// trace UI consistent and avoids paying serialisation cost twice.
 type mcpSpan struct {
-	span trace.Span
-	tags []string
+	span           trace.Span
+	tags           []string
+	outputRecorded bool
 }
 
 // appendTags appends new entries to [mcpSpan.tags] and re-sets the
@@ -145,6 +186,41 @@ func (s *mcpSpan) RecordRouteToBackend(backend string, sessionID string, isNew b
 		attribute.String("mcp.session.id", sessionID),
 		attribute.Bool("mcp.session.new", isNew),
 	))
+}
+
+// RecordResponseOutput implements [tracingapi.MCPSpan.RecordResponseOutput].
+//
+// We dual-emit the response under two semantic-convention keys so that
+// any downstream consumer (Langfuse, Phoenix, custom dashboards) can
+// pick it up:
+//   - `langfuse.observation.output` -- Langfuse-native, surfaces
+//     directly under the trace's "Output" panel.
+//   - `output.value` -- OpenInference convention; Langfuse and other
+//     LLM-observability stacks also map this to the same panel.
+//
+// Result payloads are truncated to bound span size (see
+// maxIOPayloadBytes). Empty / nil result is a no-op (e.g. JSON-RPC
+// error responses where there is no `result` field). The first
+// successful call wins; subsequent calls are no-ops to keep the
+// behavior idempotent across response paths that may decode the same
+// payload more than once (e.g. SSE fallback for a JSON response).
+func (s *mcpSpan) RecordResponseOutput(result []byte) {
+	if s == nil || s.span == nil {
+		return
+	}
+	if s.outputRecorded {
+		return
+	}
+	v := truncateForIOAttr(result)
+	if v == "" {
+		return
+	}
+	s.span.SetAttributes(
+		attribute.String("langfuse.observation.output", v),
+		attribute.String("output.value", v),
+		attribute.String("output.mime_type", "application/json"),
+	)
+	s.outputRecorded = true
 }
 
 // EndSpanOnError implements [tracingapi.MCPSpan.EndSpanOnError].
@@ -364,13 +440,59 @@ func getMCPParamsAsAttributes(p mcp.Params) []attribute.KeyValue {
 			attribute.String("mcp.tool.name", params.Name),
 			attribute.String("tool.name", params.Name),
 		)
+		// Capture the tool arguments as the span's request input. We
+		// dual-emit two semantic-convention keys so multiple OTLP
+		// receivers Just Work without bespoke remapping:
+		//   * `langfuse.observation.input` -- Langfuse-native key that
+		//     surfaces directly in the trace UI's "Input" panel.
+		//   * `input.value` -- OpenInference convention that Langfuse
+		//     also maps to the same panel and that other LLM-observability
+		//     stacks (e.g. Phoenix) understand natively.
+		// Without this, Langfuse traces show an empty "Input" tab even
+		// though tool-name and tags are populated, which makes per-tool
+		// debugging painful for ENG/ONCALL workflows.
+		if params.Arguments != nil {
+			if raw, err := json.Marshal(params.Arguments); err == nil && len(raw) > 0 {
+				v := truncateForIOAttr(raw)
+				attrs = append(attrs,
+					attribute.String("langfuse.observation.input", v),
+					attribute.String("input.value", v),
+					attribute.String("input.mime_type", "application/json"),
+				)
+			}
+		}
 	case *mcp.GetPromptParams:
 		attrs = append(attrs, attribute.String("mcp.prompt.name", params.Name))
+		// Mirror CallTool: prompt arguments are the request "input" the
+		// user typed against the prompt template, so emit them under the
+		// same dual Langfuse / OpenInference keys.
+		if len(params.Arguments) > 0 {
+			if raw, err := json.Marshal(params.Arguments); err == nil && len(raw) > 0 {
+				v := truncateForIOAttr(raw)
+				attrs = append(attrs,
+					attribute.String("langfuse.observation.input", v),
+					attribute.String("input.value", v),
+					attribute.String("input.mime_type", "application/json"),
+				)
+			}
+		}
 	case *mcp.SetLoggingLevelParams:
 		attrs = append(attrs, attribute.String("mcp.logging.level", string(params.Level)))
 	case *mcp.ListResourcesParams:
 	case *mcp.ReadResourceParams:
 		attrs = append(attrs, attribute.String("mcp.resource.uri", params.URI))
+		// The resource URI is itself the "input" the user requested. We
+		// emit it under the Langfuse / OpenInference input keys (as a
+		// JSON object, not a raw string, so the trace UI renders it
+		// consistently with CallTool / GetPrompt inputs).
+		if raw, err := json.Marshal(map[string]string{"uri": params.URI}); err == nil {
+			v := truncateForIOAttr(raw)
+			attrs = append(attrs,
+				attribute.String("langfuse.observation.input", v),
+				attribute.String("input.value", v),
+				attribute.String("input.mime_type", "application/json"),
+			)
+		}
 	case *mcp.SubscribeParams:
 		attrs = append(attrs, attribute.String("mcp.resource.uri", params.URI))
 	case *mcp.UnsubscribeParams:
