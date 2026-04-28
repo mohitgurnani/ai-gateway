@@ -5,7 +5,7 @@ gateway (Envoy AI Gateway fork) running on `10.113.24.33`. Update the
 status emoji + the per-task checkbox as work moves; do not delete
 historical sections, add new ones as new phases come up.
 
-| Last updated | 2026-04-27 (P5a friendly MCP names on AI Gateway Overview + Slack alert annotations) |
+| Last updated | 2026-04-28 (P3g real client-IP capture + P5b Langfuse Tool Names widgets) |
 |---|---|
 | Maintainer | Mohit Gurnani |
 | Source-of-truth plans | `aigw-otel-langfuse-followups_e274c333.plan.md`, `address_sohham_pr_feedback_b59bf117.plan.md`, `aigw-phase2-monitoring-stack_ef46ce8e.plan.md` |
@@ -31,6 +31,8 @@ historical sections, add new ones as new phases come up.
 | P4a | Slack `RECOVERED` notification path — `group_interval` lowered from `5m` → `1m` so resolved messages land within ~90s of an alert clearing | DONE | Mohit | [PR #12](https://github.com/nutanix-core/panacea-ai-gateway/pull/12) — branch `mohit/aigw-monitoring-stack` (`alertmanager/alertmanager.yml`). End-to-end validation: explicit-resolve push → counter `alertmanager_notifications_total{integration="slack"}` ticks twice (firing + resolved). |
 | P5 | Resource-usage observability stack (cAdvisor + node-exporter + process-exporter) + new "MCP & Gateway Resource Usage" Grafana dashboard mirroring the layout of `~eng/panacea-ai-analysis/mcp_usage_dashboard.html` | DONE | Mohit | [PR #12](https://github.com/nutanix-core/panacea-ai-gateway/pull/12) `mohit/aigw-monitoring-stack` (compose + scrape jobs + process-exporter group rules) and [PR #13](https://github.com/nutanix-core/panacea-ai-gateway/pull/13) `mohit/aigw-monitoring-dashboards` (`grafana/dashboards/mcp-usage.json`). Adds per-MCP CPU/RAM/FD/network/restart panels driven by 22 `process-exporter` cmdline-keyed groups (12 MCPs + 3 gateways + 2 content filters + sidecars). |
 | P5a | Friendly MCP names on the AI Gateway Overview dashboard — replace `host:port` legends with `mcp` labels (`diamond`, `nurag`, `atlassian`, …) and propagate the same name into Slack alerts (`MCPBackendDown`, `MCPBackendSlowProbe`) | DONE | Mohit | branch `mohit/aigw-overview-friendly-names` (per-target `labels.mcp` in `prometheus.yml` blackbox jobs + `displayName` / `legendFormat` updates in `aigw-overview.json` + `{{ $labels.mcp }}` annotations in `aigw-alerts.yml`). Verified live on `10.113.24.33:3030` after a `curl -XPOST :9091/-/reload` + Grafana provisioning reload — all 10 MCPs render by name in the Probe Status / Probe Success Ratio / Probe Duration panels. |
+| P3g | Real client-IP capture (Phase A++) — disable Docker `userland-proxy`, accept Envoy `X-Envoy-External-Address` in addition to `X-Forwarded-For`, set `MCP_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128` so the Envoy→Go loopback hop is treated as a trusted proxy. End result: `client.address` records the real laptop IP (e.g. `10.40.27.220`) instead of `127.0.0.1`, even for callers that don't set baggage. | DONE | Mohit | branch `mohit/aigw-overview-friendly-names` (stacked on PR #10) — `internal/tracing/clientaddr.go` (XEA priority), `internal/tracing/clientaddr_test.go` (3 new tests), `/etc/docker/daemon.json` `userland-proxy=false` (one-time daemon restart), `~/aigw-otel-langfuse-backup/start-*-otel.sh` `-e MCP_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128`. |
+| P5b | Langfuse "Tool Names" dashboard widgets populate — emit `openinference.span.kind=TOOL` on `CallTool` spans (reclassifies observations from `type=SPAN` to `type=TOOL`) and pivot widgets 5/7/10 from the empty Langfuse "Tool Names" dimension to the populated "Tags" dimension since the OSS dashboard editor does not yet expose `metadata.attributes.*` breakdowns. | DONE | Mohit | branch `mohit/aigw-overview-friendly-names` (stacked on PR #10) — `internal/tracing/mcp.go` (single `attribute.String("openinference.span.kind", "TOOL")` next to the existing `mcp.tool.name`/`tool.name` dual-emit on `CallTool`), `internal/tracing/mcp_test.go` (existing `Test_getMCPAttributes` extended + new `Test_getMCPAttributes_OpenInferenceKind`). Live dashboard `cmohddu5o0009lb07k127lwo6` widgets 5 / 7 / 10 / 13 manually retitled and rebroken-down via Langfuse UI. |
 | P6 | OTel Collector hardening (PII redaction processor, fan-out to Tempo/Jaeger if needed) | NOT STARTED | unowned | n/a (was P5 — renumbered after P5 resource-usage work shipped) |
 
 Legend: DONE / IN PROGRESS / NOT STARTED / BLOCKED.
@@ -990,11 +992,26 @@ Cloudflare, or the leftmost-XFF spoof becomes possible.
 #### PII contract for Phase A
 
 The gateway is internal-only on `10.113.24.33` and the captured IPs are
-RFC1918 private addresses. We explicitly accept recording them on
-spans. **If the gateway is ever exposed to non-internal callers**, the
-`client.address` attribute and any `user.id = "ip:*"` value MUST be
-scrubbed at the OTel Collector before they reach Langfuse — no source
-edits required, just a transform processor.
+expected to be RFC1918 private addresses (e.g. `10.0.0.0/8` Cursor
+laptops on the corporate network). We explicitly accept recording them
+on spans.
+
+Post-P3g (real client-IP capture deployed 2026-04-28), the
+`client.address` attribute resolves to the **real downstream peer IP**
+when Envoy is fronting the Go mcpproxy and the immediate peer
+(`127.0.0.1`) is in `MCP_TRUSTED_PROXY_CIDRS`. In the current
+deployment that means we record the connecting laptop / VM IP — which
+is still RFC1918 today but ceases to be a guarantee the moment a
+non-VPN'd or external caller hits the gateway. **If the gateway is
+ever exposed to non-internal callers** (or the user base expands
+beyond the corporate VPN), the `client.address` attribute and any
+`user.id = "ip:*"` value MUST be scrubbed at the OTel Collector
+before they reach Langfuse — a `transform` processor that drops or
+hashes any `client.address` outside `10.0.0.0/8`, `172.16.0.0/12`,
+`192.168.0.0/16`, `127.0.0.0/8`, `::1/128`, `fc00::/7` is the
+documented next step (tracked under P6 collector hardening). No source
+edits are required; the contract is intentionally OTel-collector-side
+so the gateway stays free of conditional PII branches.
 
 #### Files added / changed in Phase A
 
@@ -1037,6 +1054,195 @@ Every Phase A code path that goes away in Phase B is annotated with a
 
 Grep `Phase B TODO` in this repo to find every touchpoint.
 
+## Phase 3g — Real client-IP capture (DONE)
+
+Direct follow-up to P3f Phase A. The user reported "incase user does
+not has baggage setup in cursor client, i dont want `ip:127.0.0.1`, i
+want real ip address of user. my gateway should know the ip who is
+calling." Phase A's `auth.kind=ip` / `user.id=ip:<addr>` fallback was
+already in place, but every call from outside the VM was bucketing
+into `ip:127.0.0.1` because of two layers of source-IP loss.
+
+### Two layers of source-IP loss (pre-P3g)
+
+1. **Docker `userland-proxy=true`** (the 29.x default) rewrites every
+   published-port connection's source IP to `127.0.0.1` inside the
+   container. The Docker daemon opens a *fresh* loopback connection
+   from `docker-proxy` to the container, so the original peer IP is
+   gone before Envoy ever sees it.
+2. **Envoy → Go mcpproxy** is itself a loopback hop inside the
+   container. Even if Envoy saw the real downstream IP, the Go side
+   reads `r.RemoteAddr=127.0.0.1`. Phase A's `PickClientAddr`
+   correctly trusted `MCP_TRUSTED_PROXY_CIDRS` peers and read
+   `X-Forwarded-For`, but the env knob was unset on both gateway
+   containers — so XFF was ignored.
+
+### What changed in P3g
+
+#### Code (`mohit/aigw-overview-friendly-names`, stacked on PR #10)
+
+- **`internal/tracing/clientaddr.go::PickClientAddr`** — when the
+  immediate peer is in `MCP_TRUSTED_PROXY_CIDRS`, the resolution
+  priority is now:
+  1. `X-Envoy-External-Address` → `client.address.kind=xea`
+  2. Leftmost `X-Forwarded-For` → `client.address.kind=xff`
+  3. `r.RemoteAddr` → `client.address.kind=remote_addr`
+  XEA is preferred over XFF because Envoy sets it to a single
+  unambiguous IP (per the [HCM headers
+  docs](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_conn_man/headers#x-envoy-external-address))
+  when `use_remote_address=true`. XFF is kept as the secondary
+  fallback so non-Envoy proxies (corporate VPNs, future load
+  balancers) keep working without code changes.
+- **`internal/tracing/clientaddr_test.go`** — three new sub-tests:
+  `xea_trusted_peer` (XEA wins over XFF when peer is trusted),
+  `xea_untrusted_peer` (XEA ignored when peer not in trusted CIDRs),
+  `xea_garbage_falls_through` (junk XEA falls back to XFF leftmost).
+
+#### Operational (on `10.113.24.33`, executed 2026-04-28)
+
+- **`/etc/docker/daemon.json`** — added `"userland-proxy": false` and
+  restarted the Docker daemon. Disrupts every container on the host
+  for ~30s while iptables DNAT replaces the userland proxy; this is
+  the only knob that gets the real source IP into the container's
+  network namespace. Containers with `restart: unless-stopped` came
+  back automatically; the two `aigw-cf-stack-*-gateway` containers
+  use `--restart=no`, so they were recreated explicitly via the
+  `start-*-otel.sh` scripts after the daemon restart.
+- **`~/aigw-otel-langfuse-backup/start-gateway-otel.sh`** and
+  **`start-eval-gateway-otel.sh`** — added
+  `-e MCP_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128` to both `docker
+  run` blocks. This trusts the in-container Envoy → Go loopback hop
+  so `PickClientAddr` reads XEA / XFF instead of `127.0.0.1`.
+- **Envoy `ClientTrafficPolicy`** — initially considered (the plan
+  proposed `clientIPDetection.xForwardedFor.numTrustedHops=0` on the
+  `aigw-run` Gateway), but verification via the Envoy admin
+  `/config_dump` showed that explicitly setting
+  `clientIPDetection.xForwardedFor` actually **disables**
+  `use_remote_address` on the frontend listener and switches Envoy
+  Gateway to XFF-based detection. The default `aigw run` mode
+  already enables `use_remote_address: true` and sets
+  `xff_num_trusted_hops=0`, which is exactly what we want. Net
+  result: no `ClientTrafficPolicy` resource is applied — the default
+  is correct, and the policy was reverted from both stack-config
+  files.
+
+### Verification on `10.113.24.33`
+
+| Check | Result |
+|---|---|
+| Image rebuild | `local/ai-gateway-cli:cf-stack` rebuilt from the new branch head; both gateways recreated against the new image; `(healthy)` |
+| Daemon flip | `docker info` confirms `userland-proxy=false`; iptables DNAT preserves source IPs |
+| Env knob | `docker exec aigw-cf-stack-gateway env \| grep MCP_TRUSTED_PROXY_CIDRS` ⇒ `127.0.0.1/32,::1/128` |
+| No-baggage `CallTool` from a real laptop (10.40.27.220) | Langfuse trace records `client.address=10.40.27.220`, `client.address.kind=xea`, `auth.kind=ip`, `user.id=ip:10.40.27.220` — was `127.0.0.1` pre-P3g |
+| Baggage `CallTool` from same laptop | Langfuse trace records `auth.kind=baggage`, `user.id=<baggage value>` (precedence preserved), but `client.address=10.40.27.220` is still recorded for audit |
+| Existing dashboards | Widget #13 ("Most Active Users") now shows real `ip:10.x.x.x` buckets for ad-hoc curl smoke tests; baggage users (`mohit@nutanix.com`, etc.) keep dominating for Cursor traffic |
+
+### What's deliberately out of scope
+
+- Phase B (Okta-verified `user.id`) — `Phase B TODO:` markers stay in
+  place; no migration started.
+- PII redaction at the OTel Collector — covered as the next step in
+  the updated "PII contract for Phase A" paragraph above. The
+  collector-side `transform` processor is the right home for
+  scrubbing non-RFC1918 IPs, not gateway code.
+- Replacing the Cursor MCP static-baggage hook — `~/.cursor/mcp.json`
+  keeps working as-is; Phase B is what eventually makes it optional.
+
+## Phase 5b — Langfuse Tool Names dashboard widgets populate (DONE)
+
+User reported widgets 5, 7, 10 of the live Langfuse dashboard
+`cmohddu5o0009lb07k127lwo6` were still empty after P3e shipped.
+Diagnosis on the trace data: `tool.name` was correctly emitted on
+`CallTool` spans (verified via the public API on observation
+`6058c6c661773b46`), but the widgets group by Langfuse's **"Tool
+Names"** dimension which (per Langfuse's
+[2025-12-22 changelog](https://langfuse.com/changelog/2025-12-22-tool-calls-filtering-visualization))
+is sourced from `toolCalls` extracted from LLM **Generation**
+observations or from spans explicitly classified as
+`type=TOOL`. Our `CallTool` spans were `type=SPAN`, so the dimension
+was empty.
+
+### What changed in P5b
+
+#### Code (`mohit/aigw-overview-friendly-names`, stacked on PR #10)
+
+- **`internal/tracing/mcp.go::getMCPParamsAsAttributes`** — for
+  `*mcp.CallToolParams`, also emit
+  `attribute.String("openinference.span.kind", "TOOL")` next to the
+  existing `mcp.tool.name` / `tool.name` dual-emit. This is the
+  single attribute Langfuse's OpenInference processor reads to
+  reclassify the observation from `type=SPAN` to `type=TOOL`. The
+  attribute is **only** emitted on `CallTool`; `Initialize`,
+  `ListTools`, `GetPrompt`, `ReadResource` are not tool calls and
+  would be mis-classified by the same dimension.
+- **`internal/tracing/mcp_test.go`** — extended `Test_getMCPAttributes`
+  to assert `openinference.span.kind=TOOL` on `CallTool`, and added
+  a new dedicated test `Test_getMCPAttributes_OpenInferenceKind`
+  that asserts the attribute is **absent** on `Initialize` /
+  `ListTools` / `GetPrompt` / `ReadResource` so a future refactor
+  can't accidentally TOOL-classify non-tool-call spans.
+
+#### Dashboard (manual via Langfuse UI on `10.48.65.201:4000`)
+
+The OSS Langfuse v3.x dashboard widget editor does **not** expose
+`metadata.attributes.*` as a breakdown dimension — only fixed
+dimensions ("Tool Names", "Called Tool Names", "Name", "Tags",
+"User Id", etc.). The "Tool Names" / "Called Tool Names"
+dimensions still source from `toolCalls` JSON, not from the span
+name + `tool.name` attribute pair we emit. So even with
+`openinference.span.kind=TOOL` reclassifying the spans (verified —
+the public API now returns `type: TOOL` for `CallTool`
+observations), the "Tool Names" dimension still came up empty.
+
+The pragmatic fix per the plan's fallback is to switch the
+breakdowns to **"Tags"**. The gateway already emits
+`langfuse.tags=["backend:<server>", "role:<role>", "ticket:<ID>"]`
+from W3C baggage (PR #10 / P3b), so "Tags" gives an
+actionable per-server slicing of CallTool volume, latency and
+top-callers. Per-tool granularity (`live-debug__live_exec` vs
+`live-debug__live_connect`) is still readable from the trace
+explorer with a `tool.name` filter, just not from the dashboard
+editor.
+
+| Widget | Old name → new name | Old breakdown → new breakdown |
+|---|---|---|
+| 5 | `5) Tool calls by tool name (CallTool only)` → `5) CallTool count by Tags (server)` | `Tool Names` → `Tags` |
+| 7 | `7) Most Frequent Tool Calls` → `7) Most Frequent CallTool Server (via Tags)` | `Tool Names` → `Tags` |
+| 10 | `10) Tool Call p95 Latency by Tool` → `10) CallTool p95 Latency by Tags (server)` | `Tool Names` → `Tags` |
+| 13 | description-only update | clarifies that `ip:<addr>` is the IP-fallback bucket for callers without baggage `user`, populated post-P3g |
+
+All four widgets had their descriptions rewritten to drop the stale
+"1-line PR" comment and explain (a) what is being grouped, (b) why
+the OSS editor doesn't expose `metadata.attributes.*`, and (c) where
+to find per-tool granularity (trace explorer with `tool.name`
+filter).
+
+### Verification
+
+- Public API `GET /api/public/observations?type=TOOL` now returns
+  `CallTool` observations with `metadata.attributes.tool.name`,
+  `metadata.attributes.openinference.span.kind=TOOL`, and the
+  P3g-fed `metadata.attributes.client.address=<real IP>`,
+  `client.address.kind=xea`.
+- Dashboard widgets 5 / 7 / 10 render data on the live URL after a
+  fresh wave of 5 `CallTool` invocations across the eval gateway —
+  widget 5 shows 185 Total across 24 tag combinations, widget 7's
+  top bar is `backend:live-debug, role:engineer`, widget 10's
+  longest p95 bar is `backend:supportgpt`.
+- Widget 13 ("Most Active Users") shows the post-P3g `ip:<real IP>`
+  buckets alongside baggage-tagged users.
+
+### Future-proofing
+
+The `openinference.span.kind=TOOL` emission is forward-compatible
+with any future Langfuse upgrade that **does** populate the "Tool
+Names" / "Called Tool Names" dimension from TOOL-kind spans. When
+that happens (or when OSS Langfuse exposes a `metadata.attributes.*`
+breakdown), the widgets can be flipped back to per-tool breakdowns
+without touching gateway code. The trade-off documented inline in
+each widget description is "Tags = per-server slice (today),
+`tool.name` filter in trace explorer = per-tool drill-down".
+
 ## Change log for this tracker
 
 | Date | Change |
@@ -1051,4 +1257,5 @@ Grep `Phase B TODO` in this repo to find every touchpoint.
 | 2026-04-27 | **P3f — Phase A redeployed live to both gateways on `10.113.24.33`.** Synced VM source tree at `/home/nutanix/Desktop/mohit/cf-deploy/ai-gateway` to `mohit/otel-langfuse-native-attrs` head `90bac66d` (the PR #11 working-tree patch on the VM was a no-op against the now-merged remote, so a `git stash --include-untracked` + `git reset --hard` was clean). Rebuilt the image with `make docker-build.aigw OCI_REGISTRY=local TAG=cf-stack DOCKER_BUILD_ARGS=--load` — produced `local/ai-gateway-cli:cf-stack` sha `c66853854e4f` (build log at `/tmp/aigw-phaseA-build-20260427T221455Z.log`). Spot-checked the binary: `strings /app | grep -E "PickClientAddr\|WithClientAddr\|client\.address\|auth\.kind\|MCP_TRUSTED_PROXY_CIDRS"` finds all five plus the `clientaddr.go` source path. `/tmp/redeploy-gateways-iofix.sh` recreated both 6980 + 6981 containers in 11s; both report `(healthy)`, both pinned to image `c66853854e4f`. **Live verification (`/tmp/aigw-phaseA-smoke.sh`)**: drove two `tools/list` waves through the runtime gateway from `127.0.0.1` and queried Langfuse public API for the resulting traces. (a) Wave with full baggage `ticket=ENG-PHASEA-DEPLOY-BAGGAGE-…,user=phaseA-smoke@nutanix.com,role=engineer` produced trace `a153f7b6…` with `auth.kind=baggage`, `user.id=phaseA-smoke@nutanix.com`, **and** `client.address=127.0.0.1` / `client.address.kind=remote_addr` recorded for audit even though baggage won — exactly the precedence rule we wired in. (b) Wave with only a ticket marker (no `user`/`role` baggage) produced trace `b225f0a0…` with `auth.kind=ip`, `user.id=ip:127.0.0.1`, `client.address=127.0.0.1`, `client.address.kind=remote_addr` — proves the IP fallback for untagged callers. Both Langfuse trace `userId` columns now reflect identity end-to-end (handler → context → tracer → OTel collector → Langfuse). No anonymous-path test driven from a real HTTP request (covered by unit tests; impossible to trigger without subverting `r.RemoteAddr`). The `MCP_TRUSTED_PROXY_CIDRS` knob was deliberately left unset on the VM (no L7 proxy fronts the gateway), so XFF is correctly ignored. |
 | 2026-04-27 | **P3f — Phase A: client-network identity fallback for `user.id` (`mohit/otel-langfuse-native-attrs`, stacked on PR #10).** User asked: "if we have Okta later, would we get the actual user via Okta? And if a caller doesn't set the static baggage, can we use IP instead to track volume / audit / rate-limit?" Phase A says yes to part two (and pre-stages the Phase B sunset for part one). Added `internal/tracing/clientaddr.go` with `PickClientAddr(*http.Request)` (XFF leftmost when peer is in `MCP_TRUSTED_PROXY_CIDRS`, else `RemoteAddr`) + `WithClientAddr(ctx, addr, kind)` context plumbing. `internal/mcpproxy/handlers.go::servePOST` now stashes the captured address on the request context once at request start. `internal/tracing/mcp.go::StartSpanAndInjectMeta` reads it back and emits three new attrs: `auth.kind` (always — `baggage` / `ip` / `anonymous`), `client.address` (canonical IP), `client.address.kind` (`xff` / `remote_addr`). When no baggage `user` is set, `user.id` is filled with the literal `"ip:<addr>"` so per-user dashboards keep bucketing untagged callers. Baggage user wins over IP; if both are present, `auth.kind=baggage`, `user.id` = baggage value, and the IP is recorded only as `client.address` for audit. PII contract: gateway is internal-only on `10.113.24.33`, IPs are RFC1918 — recording accepted; if exposed externally, scrub at the OTel Collector. New env knob `MCP_TRUSTED_PROXY_CIDRS` — comma-separated CIDRs (bare IPs accepted as `/32`/`/128` shortcuts), default empty (correct for current deployment). All Phase B sunset paths are flagged with `Phase B TODO:` comments in-line so the Okta migration is mechanical. Tests: 4 new tests in `mcp_test.go` (`AuthKindBaggage`, `AuthKindIP`, `AuthKindAnonymous`, `BaggageBeatsIP`) + a full unit-test file `clientaddr_test.go` (RemoteAddr / IPv6 / XFF trusted / XFF ignored when untrusted / bare-IP CIDR / garbage XFF / context round-trip). `go vet ./...`, `go build ./...`, `go test ./internal/tracing/... ./internal/mcpproxy/...` all pass. Added "Phase A vs Phase B" section above so future readers see the migration plan inline. |
 | 2026-04-27 | **P3e — Capture MCP CallTool input/output for Langfuse (`mohit/lf-input-output-capture`, [PR #11](https://github.com/nutanix-core/panacea-ai-gateway/pull/11)).** User flagged that the Input/Output panels in Langfuse traces (e.g. `diamond` MCP) were empty even though PR-#10 native attrs were landing. Diagnosis: `getMCPParamsAsAttributes` only emitted tool/prompt/resource names, never `params.Arguments`; and `MCPSpan.EndSpan()` was called before `proxyResponseBody` decoded the JSON-RPC result, so there was no live span to write `output.value` on. Fix shipped on commit `f796f6c9` stacked on top of PR #10: (1) `tracingapi.MCPSpan` extended with `RecordResponseOutput([]byte)` (one-shot, truncates, dual-emits Langfuse + OpenInference output attrs); (2) `internal/tracing/mcp.go` JSON-encodes `Arguments`/`URI`, truncates to 8 KiB, dual-emits `langfuse.observation.input` + `input.value` + `input.mime_type`; (3) `internal/mcpproxy/mcpproxy.go` adds `currentSpan` to the request context; (4) `internal/mcpproxy/handlers.go` stashes the span at `parseParamsAndMaybeStartSpan` and a new `recordSpanOutput(*jsonrpc.Response)` helper is invoked from both the JSON and the SSE response paths inside `proxyResponseBody` (matters for `atlassian`/`slack` which only respond via SSE); (5) tests: `mcp_test.go` extended for input attrs on `CallTool`/`GetPrompt`/`ReadResource`, `mcpproxy_test.go::fakeSpan` captures every `RecordResponseOutput` invocation. Built on the VM (`make docker-build.aigw`), redeployed both gateways via `/tmp/redeploy-gateways-iofix.sh` (preserves env/port/volume), drove `nurag` + `supportgpt` + `diamond` `CallTool` waves with `baggage: ticket=ENG-LF-IO-VERIFY,user=mohit,role=engineer`. Verification: Langfuse public API now returns non-null `input`/`output` for those traces (was `null` pre-fix); UI Input/Output panels render JSON; Tags-filter walkthrough (sidebar → expand Tags → type `ticket` → click `ticket:ENG-LF-IO-VERIFY`) narrows traces list to exactly the 6 rows from the verification wave; dashboard `cmohddu5o0009lb07k127lwo6` widgets all populate fresh data with no regression. Screenshots saved under `panacea-ingestion-pipeline/.playwright-mcp/lf_*` (trace detail, traces-filtered-by-ticket, dashboard top/mid/low/bottom). |
+| 2026-04-28 | **P3g + P5b — Real client-IP capture and Langfuse Tool Names widgets populate (`mohit/aigw-overview-friendly-names`, stacked on PR #10).** Two follow-ups in one push, both verified live on `10.113.24.33`. (1) **P3g real client-IP capture.** User reported "incase user does not has baggage setup in cursor client, i dont want `ip:127.0.0.1`, i want real ip address of user." Phase A's `auth.kind=ip` / `user.id=ip:<addr>` fallback was already shipping but bucketing every external call into `ip:127.0.0.1` because of (a) Docker `userland-proxy=true` rewriting source IPs at the `docker-proxy` hop and (b) the in-container Envoy → Go mcpproxy loopback hop showing `r.RemoteAddr=127.0.0.1` to the Go side. Code change: `internal/tracing/clientaddr.go::PickClientAddr` now consults `X-Envoy-External-Address` first (Envoy's single canonical client IP per the HCM headers docs) when the peer is in `MCP_TRUSTED_PROXY_CIDRS`, then leftmost `X-Forwarded-For`, then `r.RemoteAddr`. Three new sub-tests in `clientaddr_test.go` cover trusted XEA, untrusted XEA (peer not in CIDRs), and garbage-XEA-fallback-to-XFF. Operational: flipped `/etc/docker/daemon.json` to `"userland-proxy": false` (one-time daemon restart, ~30s outage; containers with `restart: unless-stopped` came back automatically; the `aigw-cf-stack-*-gateway` containers use `--restart=no` so they were recreated explicitly via the existing `start-*-otel.sh` scripts). Added `-e MCP_TRUSTED_PROXY_CIDRS=127.0.0.1/32,::1/128` to both gateway start scripts. Considered (and reverted) an Envoy `ClientTrafficPolicy` with `clientIPDetection.xForwardedFor.numTrustedHops=0` — verification via Envoy admin `/config_dump` showed it actually **disables** `use_remote_address` on the frontend listener and switches Envoy Gateway to XFF-based detection; the default `aigw run` mode already enables `use_remote_address: true` and `xff_num_trusted_hops=0`, which is the desired state. Live verification: a no-baggage `CallTool` from a real laptop (`10.40.27.220`) now records `client.address=10.40.27.220`, `client.address.kind=xea`, `auth.kind=ip`, `user.id=ip:10.40.27.220` (was `127.0.0.1` pre-P3g); a baggage `CallTool` from the same laptop records `auth.kind=baggage`, `user.id=<baggage>`, but `client.address=10.40.27.220` is still recorded for audit. Updated the "PII contract for Phase A" section above to flag that real laptop IPs (still RFC1918 today, not guaranteed forever) now appear in `client.address` and that the OTel Collector `transform` processor is the documented next step (P6) for scrubbing non-RFC1918 IPs. (2) **P5b Langfuse Tool Names widgets populate.** Widgets 5/7/10 of dashboard `cmohddu5o0009lb07k127lwo6` were still empty because Langfuse's "Tool Names" dimension sources from LLM Generation `toolCalls` JSON or `type=TOOL` observations, not arbitrary `metadata.attributes.tool.name`. Fix: `internal/tracing/mcp.go::getMCPParamsAsAttributes` for `*mcp.CallToolParams` now also emits `attribute.String("openinference.span.kind", "TOOL")` (single attribute, deliberately scoped to `CallTool` only — `Initialize`/`ListTools`/`GetPrompt`/`ReadResource` would be mis-classified). Verified via the public observations API: `CallTool` spans now return `type: TOOL` with `metadata.attributes.openinference.span.kind=TOOL` alongside the existing `tool.name`/`mcp.tool.name` dual-emit. Tests: extended `Test_getMCPAttributes` to assert the new attribute on `CallTool`, added new `Test_getMCPAttributes_OpenInferenceKind` that asserts the attribute is **absent** on the four non-tool-call methods so a future refactor can't TOOL-classify them. Discovered that the OSS Langfuse v3.x dashboard widget editor still doesn't expose `metadata.attributes.*` as a breakdown dimension — only fixed dimensions (Tool Names, Called Tool Names, Tags, Name, User Id, etc.), and "Tool Names" / "Called Tool Names" still source from `toolCalls` JSON not from the span `name`+`tool.name` pair we emit. Pivoted widgets 5/7/10 to the **Tags** breakdown (the gateway already emits `langfuse.tags=["backend:<server>","role:<role>","ticket:<ID>"]` from W3C baggage per PR #10 / P3b), gave them descriptions explaining the Tags-vs-Tool-Names trade-off and pointing readers at the trace explorer with a `tool.name` filter for per-tool drill-down. Widget 13 ("Most Active Users") description was also rewritten to clarify that `ip:<addr>` is the IP-fallback bucket for callers without baggage `user`, populated post-P3g. Live results: widget 5 shows 185 Total across 24 tag combinations, widget 7's top bar is `backend:live-debug, role:engineer`, widget 10's longest p95 bar is `backend:supportgpt`; widget 13 shows real `ip:10.x.x.x` buckets alongside baggage users. The `openinference.span.kind=TOOL` emission stays in code as forward-compat: any future Langfuse upgrade (or an OSS editor that exposes `metadata.attributes.*`) lets the widgets be flipped back to per-tool breakdowns without touching gateway code. |
 | 2026-04-27 | **P4a + P5 — Slack `RECOVERED` fix and resource-usage observability landed ([PR #12](https://github.com/nutanix-core/panacea-ai-gateway/pull/12) `mohit/aigw-monitoring-stack` + [PR #13](https://github.com/nutanix-core/panacea-ai-gateway/pull/13) `mohit/aigw-monitoring-dashboards`, both stacked on PR #10).** Two follow-ups in one push: (1) **Slack resolved-path fix** — user reported "I did not see resolved notification in Slack yet." Diagnosis: `group_interval: 5m` in `alertmanager.yml` was the dispatch slot Alertmanager uses for `send_resolved` follow-ups; the message was technically being sent but operators close Slack inside the 5-minute gap. Lowered `group_interval` to `1m` (matching the retired `mcp-health-monitor`'s perceived UX). End-to-end validation on the live VM: pushed synthetic `DashboardSmokeTestV2` then explicit-resolved it, the counter `alertmanager_notifications_total{integration="slack"}` ticked twice (`21 → 22` within 90s) — confirming both firing and `RECOVERED` reach `#panacea-mcp-monitoring`. (2) **Resource-usage observability** — added three exporters and a brand-new Grafana dashboard mirroring `~eng/panacea-ai-analysis/mcp_usage_dashboard.html` against locally-scraped data: `cadvisor:v0.51.0` (per-container CPU/RAM/network/restarts; v0.51.0 is mandatory because v0.49.x misses cgroup-v2+systemd paths on Ubuntu 24.04, and we mount `/run/containerd/containerd.sock` so it resolves runtime metadata), `node-exporter:v1.8.2` (host CPU/RAM/load/disk), and `process-exporter:0.8.7` (per-process FD count grouped by cmdline regex — this is how we get **per-MCP file descriptors** even though every MCP runs as `python` from the host's view). 22 process-exporter groups in production: 12 MCPs (`mcp:jita-mcp`, `mcp:mcp-atlassian`, `mcp:nurag-unified-server`, `mcp:glean-supergateway`, `mcp:diamond-mcp-http`, `mcp:supportgpt-mcp`, `mcp:knowledge_graph`, `mcp:live_debug_mcp`, `mcp:panacea_mcp`, `mcp:jita-mount-app`, `mcp:slack-mcp`, `mcp:sourcegraph-mcp-http`) + 3 gateways (`gateway:port-6065/6067/6068`) + 2 content filters (`content-filter:go`, `content-filter:python-parity`) + 5 host services. New `mcp-usage` Grafana dashboard (`uid=aigw-mcp-usage`) lays out 18 non-row panels in the diamond reference order: 6-stat host overview → sortable per-container CPU/Memory/Restarts/RX/TX table → 4 MCP-container timeseries (CPU, working-set memory, per-group FDs, network) → 4 tool-call panels split by `mcp_backend` (rate/p95/errors/top-methods) ← ties resource view back to PR #10's Langfuse-native attrs → 3 process-group FD timeseries (all groups, top-15 per-MCP, per-MCP CPU%). Picked Grafana-only (no Langfuse change) because Prometheus already has every metric we need and the user wanted "FDs per MCP" which is a `/proc`-level question Langfuse doesn't answer. Dashboard chooses `Restarts (24h)` over `container_processes`/`container_tasks_state` because both read zero for healthy containers on cgroup-v2; chooses `process-exporter` over the dropped `container_file_descriptors` cAdvisor metric for FD counts. Dashboard top-of-page links jump back to the AI-Gateway-Overview dashboard and the Langfuse traces UI for trace-level pivot. Validation: 18 panels render with live data on the running VM, all 22 process-exporter groups report non-zero `num_procs`/`open_filedesc`, no MCP falls to the `other:*` bucket. Screenshots: `panacea-ingestion-pipeline/.playwright-mcp/mcp-usage-dashboard-v4-{top,mid}.png`. Repo home: `panacea-ai-gateway/deploy/monitoring/` (compose, prometheus rules + scrape jobs, alertmanager, otel-collector, blackbox, process-exporter group rules, README, .env.example, secret-file `.gitignore`). PRs: `mohit/aigw-monitoring-stack` (everything except dashboards) targeting PR #10's branch + `mohit/aigw-monitoring-dashboards` (`grafana/dashboards/{aigw-overview,mcp-usage}.json`) targeting the stack branch — explicit two-step stack so each PR is a coherent review unit. |

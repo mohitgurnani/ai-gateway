@@ -163,6 +163,63 @@ func TestPickClientAddr(t *testing.T) {
 		require.Equal(t, "10.113.24.55", addr)
 		require.Equal(t, "remote_addr", kind)
 	})
+
+	t.Run("XEA wins over XFF when peer is trusted", func(t *testing.T) {
+		// Envoy populates X-Envoy-External-Address as a single
+		// trusted IP; we prefer it over XFF (which can be a chain
+		// from an arbitrary upstream).
+		resetTrustedProxyCIDRsForTest()
+		t.Cleanup(resetTrustedProxyCIDRsForTest)
+		t.Setenv(MCPTrustedProxyCIDRsEnv, "127.0.0.1/32")
+
+		r := &http.Request{
+			RemoteAddr: "127.0.0.1:51234",
+			Header: http.Header{
+				"X-Envoy-External-Address": []string{"10.150.20.30"},
+				"X-Forwarded-For":          []string{"203.0.113.7, 10.150.20.30"},
+			},
+		}
+		addr, kind := PickClientAddr(r)
+		require.Equal(t, "10.150.20.30", addr)
+		require.Equal(t, "xea", kind)
+	})
+
+	t.Run("XEA is ignored when peer is NOT trusted", func(t *testing.T) {
+		// Even with XEA set, an untrusted peer must not be allowed
+		// to spoof the client IP.
+		resetTrustedProxyCIDRsForTest()
+		t.Cleanup(resetTrustedProxyCIDRsForTest)
+		t.Setenv(MCPTrustedProxyCIDRsEnv, "")
+
+		r := &http.Request{
+			RemoteAddr: "10.113.24.55:51234",
+			Header: http.Header{
+				"X-Envoy-External-Address": []string{"10.150.20.30"},
+			},
+		}
+		addr, kind := PickClientAddr(r)
+		require.Equal(t, "10.113.24.55", addr)
+		require.Equal(t, "remote_addr", kind)
+	})
+
+	t.Run("garbage XEA falls through to XFF leftmost", func(t *testing.T) {
+		// A malformed XEA value should not block XFF parsing; the
+		// resolver moves on to the next-priority source.
+		resetTrustedProxyCIDRsForTest()
+		t.Cleanup(resetTrustedProxyCIDRsForTest)
+		t.Setenv(MCPTrustedProxyCIDRsEnv, "127.0.0.1/32")
+
+		r := &http.Request{
+			RemoteAddr: "127.0.0.1:51234",
+			Header: http.Header{
+				"X-Envoy-External-Address": []string{"not-an-ip"},
+				"X-Forwarded-For":          []string{"10.150.20.30, 127.0.0.1"},
+			},
+		}
+		addr, kind := PickClientAddr(r)
+		require.Equal(t, "10.150.20.30", addr)
+		require.Equal(t, "xff", kind)
+	})
 }
 
 func TestWithClientAddrRoundtrip(t *testing.T) {

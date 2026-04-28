@@ -489,9 +489,21 @@ func getMCPParamsAsAttributes(p mcp.Params) []attribute.KeyValue {
 		// indexes as the dashboard "Tool Names" dimension. Writing both
 		// preserves the original contract while unlocking native dashboard
 		// group-by on tool name.
+		//
+		// `openinference.span.kind = "TOOL"` is the OpenInference
+		// classification attribute that Langfuse's ingest reads to flag
+		// the observation as a tool-call. Without it the span is
+		// recorded as a generic SPAN, which Langfuse's "Tool Names"
+		// dashboard dimension (sourced from TOOL-kind observations and
+		// LLM-generation `toolCalls`) ignores. This single attribute is
+		// what makes the dashboard widgets group-by tool name populate.
+		// Only emitted for CallTool: Initialize / ListTools /
+		// GetPrompt / ReadResource are not tool calls and would be
+		// mis-classified.
 		attrs = append(attrs,
 			attribute.String("mcp.tool.name", params.Name),
 			attribute.String("tool.name", params.Name),
+			attribute.String("openinference.span.kind", "TOOL"),
 		)
 		// Capture the tool arguments as the span's request input. We
 		// dual-emit two semantic-convention keys so multiple OTLP

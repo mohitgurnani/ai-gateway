@@ -263,6 +263,77 @@ func TestTracer_BaggageEmptyValueSkipped(t *testing.T) {
 		"non-empty baggage values in the same header must still be promoted")
 }
 
+// TestTracer_BaggagePromotesToLangfuseNativeAttrs verifies the canonical
+// promotion path the [`docs/ticket-propagation-contract.md`] hangs its hat on:
+// a realistic client baggage header arrives, and the gateway emits the
+// Langfuse-native dimensions (`user.id`, `langfuse.tags`, `auth.kind`)
+// engineers filter on. If someone breaks this, every per-incident MCP
+// ledger query in Langfuse silently goes empty -- that's worth a named test.
+func TestTracer_BaggagePromotesToLangfuseNativeAttrs(t *testing.T) {
+	exporter := tracetest.NewInMemoryExporter()
+	tp := trace.NewTracerProvider(trace.WithSyncer(exporter))
+	tracer := newMCPTracer(tp.Tracer("test"), autoprop.NewTextMapPropagator(), nil)
+
+	// Real-world shape: an engineer triaging ENG-918015 from cursor-cli.
+	// Including a non-allow-listed key (`opaque`) to confirm it does not
+	// pollute span attributes but does still propagate downstream.
+	headers := http.Header{}
+	headers.Set("baggage",
+		"ticket=ENG-918015,user=alice%40nutanix.com,role=engineer,opaque=keep-me")
+
+	reqID, _ := jsonrpc.MakeID("id")
+	r := &jsonrpc.Request{ID: reqID, Method: "tools/call"}
+	p := &mcp.CallToolParams{Name: "search"}
+
+	span := tracer.StartSpanAndInjectMeta(context.Background(), r, p, headers)
+	require.NotNil(t, span)
+	span.EndSpan()
+
+	spans := exporter.GetSpans()
+	require.Len(t, spans, 1)
+	attrs := spans[0].Attributes
+
+	// `user.id` is what Langfuse indexes as the dashboard `userId`.
+	require.Contains(t, attrs, attribute.String("user.id", "alice@nutanix.com"),
+		"baggage user must promote to Langfuse-native user.id")
+
+	// `langfuse.tags` carries the per-incident filter key. Find the
+	// slice attribute and assert it contains both ticket and role tags.
+	var (
+		tagsAttr      attribute.KeyValue
+		tagsAttrFound bool
+	)
+	for _, a := range attrs {
+		if a.Key == "langfuse.tags" {
+			tagsAttr = a
+			tagsAttrFound = true
+			break
+		}
+	}
+	require.True(t, tagsAttrFound, "langfuse.tags must be set when ticket/role baggage are present")
+	tagSlice := tagsAttr.Value.AsStringSlice()
+	require.Contains(t, tagSlice, "ticket:ENG-918015",
+		"ticket baggage must promote to a langfuse.tags entry; this is the canonical MCP-ledger join key")
+	require.Contains(t, tagSlice, "role:engineer",
+		"role baggage must promote to a langfuse.tags entry")
+
+	// `auth.kind` distinguishes trusted-identity (baggage) from fallback (ip / anonymous).
+	require.Contains(t, attrs, attribute.String("auth.kind", "baggage"),
+		"baggage-supplied user must mark the span as auth.kind=baggage so dashboards can tell trusted callers apart")
+
+	// Allow-list integrity: opaque keys do not become span attributes.
+	for _, a := range attrs {
+		require.NotEqual(t, attribute.Key("mcp.client.opaque"), a.Key,
+			"non-allow-listed baggage keys must not be promoted to span attributes")
+	}
+
+	// Outbound propagation: the full baggage (including opaque) must
+	// continue downstream so non-gateway services keep correlating.
+	outBaggage := headers.Get("baggage")
+	require.Contains(t, outBaggage, "ticket=ENG-918015")
+	require.Contains(t, outBaggage, "opaque=keep-me")
+}
+
 // TestBaggageAttrsFromEnv_OptIn verifies the operator-level opt-in
 // behavior of MCP_TRACE_BAGGAGE_ATTRS.
 func TestBaggageAttrsFromEnv_OptIn(t *testing.T) {
@@ -336,6 +407,12 @@ func Test_getMCPAttributes(t *testing.T) {
 			expected: []attribute.KeyValue{
 				attribute.String("mcp.tool.name", "fake-tool"),
 				attribute.String("tool.name", "fake-tool"),
+				// openinference.span.kind=TOOL is required for
+				// Langfuse's "Tool Names" dashboard dimension to
+				// include this observation. Only emitted on
+				// CallTool spans, never on Initialize / ListTools
+				// / GetPrompt / ReadResource.
+				attribute.String("openinference.span.kind", "TOOL"),
 			},
 		},
 		{
@@ -432,6 +509,7 @@ func Test_getMCPAttributes(t *testing.T) {
 			expected: []attribute.KeyValue{
 				attribute.String("mcp.tool.name", "fake-tool"),
 				attribute.String("tool.name", "fake-tool"),
+				attribute.String("openinference.span.kind", "TOOL"),
 				attribute.String("langfuse.observation.input", `{"a":1,"b":"x"}`),
 				attribute.String("input.value", `{"a":1,"b":"x"}`),
 				attribute.String("input.mime_type", "application/json"),
@@ -455,6 +533,45 @@ func Test_getMCPAttributes(t *testing.T) {
 	for _, tc := range cases {
 		t.Run("", func(t *testing.T) {
 			require.Equal(t, tc.expected, getMCPParamsAsAttributes(tc.p))
+		})
+	}
+}
+
+// Test_getMCPAttributes_OpenInferenceKind asserts that
+// `openinference.span.kind = "TOOL"` is emitted exactly on
+// CallToolParams and NOT on any other MCP request type. Langfuse's
+// "Tool Names" dashboard dimension would mis-classify ListTools /
+// GetPrompt / ReadResource spans as tool-calls if this leaked.
+func Test_getMCPAttributes_OpenInferenceKind(t *testing.T) {
+	hasOpenInferenceTool := func(attrs []attribute.KeyValue) bool {
+		for _, a := range attrs {
+			if string(a.Key) == "openinference.span.kind" && a.Value.AsString() == "TOOL" {
+				return true
+			}
+		}
+		return false
+	}
+
+	t.Run("CallTool gets TOOL kind", func(t *testing.T) {
+		got := getMCPParamsAsAttributes(&mcp.CallToolParams{Name: "x"})
+		require.True(t, hasOpenInferenceTool(got),
+			"CallTool must emit openinference.span.kind=TOOL")
+	})
+
+	nonToolCases := []struct {
+		name string
+		p    mcp.Params
+	}{
+		{name: "Initialize", p: &mcp.InitializeParams{}},
+		{name: "ListTools", p: &mcp.ListToolsParams{}},
+		{name: "GetPrompt", p: &mcp.GetPromptParams{Name: "x"}},
+		{name: "ReadResource", p: &mcp.ReadResourceParams{URI: "x"}},
+	}
+	for _, tc := range nonToolCases {
+		t.Run(tc.name+" must NOT have TOOL kind", func(t *testing.T) {
+			got := getMCPParamsAsAttributes(tc.p)
+			require.False(t, hasOpenInferenceTool(got),
+				"%s must not emit openinference.span.kind=TOOL", tc.name)
 		})
 	}
 }

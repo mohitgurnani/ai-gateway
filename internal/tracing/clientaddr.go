@@ -94,14 +94,29 @@ func parseTrustedProxyCIDRs(raw string) []*net.IPNet {
 // [mcpTracer.StartSpanAndInjectMeta] so dashboards can tell trusted-
 // proxy XFF and direct-peer addresses apart.
 //
-// Resolution priority:
+// Resolution priority (when the immediate peer is in
+// [MCPTrustedProxyCIDRsEnv]):
 //
-//  1. If the immediate peer (host portion of r.RemoteAddr) is contained
-//     in [MCPTrustedProxyCIDRsEnv] AND X-Forwarded-For is non-empty,
-//     return the *leftmost* XFF entry. Returned kind: "xff".
-//  2. Else return the host portion of r.RemoteAddr. Returned kind:
-//     "remote_addr".
-//  3. If neither yields a parseable IP, return ("", "anonymous").
+//  1. `X-Envoy-External-Address` if it parses as a single IP. Returned
+//     kind: "xea". Envoy populates this header with the original peer
+//     address when the listener is configured with
+//     `use_remote_address: true` (e.g. via an Envoy Gateway
+//     `ClientTrafficPolicy.clientIPDetection.xForwardedFor.numTrustedHops`).
+//     XEA is preferred over XFF because it's a single, unambiguous
+//     value that Envoy guarantees to be the trusted external address;
+//     XFF can be a comma-separated chain that we'd have to walk and
+//     re-trust.
+//  2. Leftmost `X-Forwarded-For` entry. Returned kind: "xff". Kept for
+//     non-Envoy proxies (corporate VPNs, future load balancers) and
+//     for SSE-only paths where Envoy may not synthesize XEA.
+//
+// When the peer is NOT in the trusted-proxy set, both XEA and XFF are
+// ignored to prevent a malicious upstream from spoofing the client IP.
+// Resolution then falls through to:
+//
+//  3. Host portion of r.RemoteAddr. Returned kind: "remote_addr".
+//  4. If none of the above yields a parseable IP, return
+//     ("", "anonymous").
 //
 // The returned address is the canonical IP-only form: no port, no
 // brackets, no IPv6 zone identifier.
@@ -120,6 +135,9 @@ func PickClientAddr(r *http.Request) (addr, kind string) {
 	peer := remoteAddrIP(r.RemoteAddr)
 
 	if peer != "" && peerIsTrustedProxy(peer) {
+		if xea := normalizeIP(strings.TrimSpace(r.Header.Get("X-Envoy-External-Address"))); xea != "" {
+			return xea, "xea"
+		}
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			if leftmost := normalizeIP(firstCSV(xff)); leftmost != "" {
 				return leftmost, "xff"
