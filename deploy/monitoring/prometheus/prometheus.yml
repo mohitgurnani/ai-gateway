@@ -39,22 +39,42 @@ scrape_configs:
       - targets: ["otel-collector:8888"]
 
   # Core MCP set picked for Phase 2 (matches what the gateway routes to today).
+  #
+  # Each target gets a friendly `mcp` label via per-target `labels:` block. We
+  # also keep the bare `host:port` string as `instance` so existing alerts /
+  # debug queries that use `{{ $labels.instance }}` still work, and `mcp_port`
+  # is extracted via relabel_configs for the same reason. The dashboard
+  # legends now key on `{{mcp}}` (see grafana/dashboards/aigw-overview.json)
+  # so the UI shows "diamond" instead of "host.docker.internal:3001".
+  #
+  # Adding a new MCP: drop a new `- targets: [...]` entry below with its
+  # `mcp:` label and reload Prometheus (`curl -XPOST :9091/-/reload` on the
+  # VM). Grafana picks up the new series automatically.
+  #
   # Group A: standard /health endpoint.
   - job_name: blackbox-mcp-health
     metrics_path: /probe
     params:
       module: [http_2xx_health]
     static_configs:
-      - targets:
-          - http://host.docker.internal:3001/health   # diamond
-          - http://host.docker.internal:3002/health   # sourcegraph
-          - http://host.docker.internal:3003/health   # jita
-          - http://host.docker.internal:3004/health   # supportgpt
-          - http://host.docker.internal:3005/health   # knowledge-graph
-          - http://host.docker.internal:3007/health   # nurag
-          - http://host.docker.internal:3009/health   # slack
-          - http://host.docker.internal:3010/health   # mcp
-          - http://host.docker.internal:3011/health   # live-debug
+      - targets: [http://host.docker.internal:3001/health]
+        labels: {mcp: diamond}
+      - targets: [http://host.docker.internal:3002/health]
+        labels: {mcp: sourcegraph}
+      - targets: [http://host.docker.internal:3003/health]
+        labels: {mcp: jita}
+      - targets: [http://host.docker.internal:3004/health]
+        labels: {mcp: supportgpt}
+      - targets: [http://host.docker.internal:3005/health]
+        labels: {mcp: knowledge-graph}
+      - targets: [http://host.docker.internal:3007/health]
+        labels: {mcp: nurag}
+      - targets: [http://host.docker.internal:3009/health]
+        labels: {mcp: slack}
+      - targets: [http://host.docker.internal:3010/health]
+        labels: {mcp: panacea-mcp}
+      - targets: [http://host.docker.internal:3011/health]
+        labels: {mcp: live-debug}
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target
@@ -73,8 +93,8 @@ scrape_configs:
     params:
       module: [http_2xx_healthz]
     static_configs:
-      - targets:
-          - http://host.docker.internal:3008/healthz  # atlassian
+      - targets: [http://host.docker.internal:3008/healthz]
+        labels: {mcp: atlassian}
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

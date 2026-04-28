@@ -102,12 +102,13 @@
         "type": "prometheus",
         "uid": "prometheus"
       },
-      "description": "MCP up-probe outcome from blackbox-exporter. 1=2xx, 0=fail/timeout.",
+      "description": "MCP up-probe outcome from blackbox-exporter. 1=2xx, 0=fail/timeout. Tile labelled with the friendly MCP name (mcp label on the scrape job).",
       "fieldConfig": {
         "defaults": {
           "color": {
             "mode": "thresholds"
           },
+          "displayName": "${__field.labels.mcp}",
           "mappings": [
             {
               "options": {
@@ -163,8 +164,8 @@
       "pluginVersion": "11.4.0",
       "targets": [
         {
-          "expr": "probe_success",
-          "legendFormat": "{{instance}}",
+          "expr": "probe_success{job=~\"blackbox-mcp-(health|healthz)\", mcp!=\"\"}",
+          "legendFormat": "{{mcp}}",
           "refId": "A"
         }
       ],
@@ -252,8 +253,8 @@
       "pluginVersion": "11.4.0",
       "targets": [
         {
-          "expr": "avg_over_time(probe_success[5m])",
-          "legendFormat": "{{instance}}",
+          "expr": "avg_over_time(probe_success{job=~\"blackbox-mcp-(health|healthz)\", mcp!=\"\"}[5m])",
+          "legendFormat": "{{mcp}}",
           "refId": "A"
         }
       ],
@@ -339,8 +340,8 @@
       "pluginVersion": "11.4.0",
       "targets": [
         {
-          "expr": "probe_duration_seconds",
-          "legendFormat": "{{instance}}",
+          "expr": "probe_duration_seconds{job=~\"blackbox-mcp-(health|healthz)\", mcp!=\"\"}",
+          "legendFormat": "{{mcp}}",
           "refId": "A"
         }
       ],
@@ -544,6 +545,6 @@
   "timezone": "utc",
   "title": "AI Gateway Overview",
   "uid": "aigw-overview",
-  "version": 1,
+  "version": 3,
   "weekStart": ""
 }

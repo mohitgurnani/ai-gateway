@@ -69,27 +69,31 @@ groups:
     rules:
       # Replaces the standalone mcp-health-monitor.
       # MCP backend up/down based on /health or /healthz probe success.
+      # We page using the friendly `mcp` label (e.g. "diamond", "atlassian")
+      # instead of the raw host:port. The port is still on the alert as
+      # `{{ $labels.mcp_port }}` for triage, and the bare host:port is on
+      # `{{ $labels.instance }}` if anyone needs it.
       - alert: MCPBackendDown
         expr: probe_success{job=~"blackbox-mcp-(health|healthz)"} == 0
         for: 5m
         labels:
           severity: critical
-          service: mcp-backend
+          service: "{{ $labels.mcp }}"
           runbook: "telemetry-rollout-tracker.md#mcp-backend-down"
         annotations:
-          summary: "MCP backend {{ $labels.instance }} is DOWN"
-          description: "Health probe for {{ $labels.instance }} (port {{ $labels.mcp_port }}) has been failing for >=5m. Connections from the gateway to this backend will time out or 503."
+          summary: "MCP backend {{ $labels.mcp }} is DOWN"
+          description: "Health probe for `{{ $labels.mcp }}` (port {{ $labels.mcp_port }}, target `{{ $labels.instance }}`) has been failing for >=5m. Connections from the gateway to this backend will time out or 503."
 
       - alert: MCPBackendSlowProbe
         expr: probe_duration_seconds{job=~"blackbox-mcp-(health|healthz)"} > 5
         for: 10m
         labels:
           severity: warning
-          service: mcp-backend
+          service: "{{ $labels.mcp }}"
           runbook: "telemetry-rollout-tracker.md#mcp-backend-slow"
         annotations:
-          summary: "MCP backend {{ $labels.instance }} is slow (probe >5s)"
-          description: "Health probe for {{ $labels.instance }} (port {{ $labels.mcp_port }}) has been taking >5s for >=10m. End-user calls through the gateway are likely timing out."
+          summary: "MCP backend {{ $labels.mcp }} is slow (probe >5s)"
+          description: "Health probe for `{{ $labels.mcp }}` (port {{ $labels.mcp_port }}, target `{{ $labels.instance }}`) has been taking >5s for >=10m. End-user calls through the gateway are likely timing out."
 
   - name: traffic-anomalies
     interval: 30s
