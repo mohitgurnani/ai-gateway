@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+panacea-baggage-shim -- local reverse proxy that injects the active triage
+ticket into the W3C `baggage` header on outbound MCP traffic before
+forwarding to the Panacea AI Gateway.
+
+Why: Cursor IDE's ~/.cursor/mcp.json is loaded once at startup and cannot
+carry per-session ticket=<id>. We close that gap with a tiny user-local
+sidecar (same shape as Datadog tag injectors / OTel Collector transform
+processors / Envoy header_to_metadata).
+
+Contract: see panacea-ai-gateway/docs/ticket-propagation-contract.md.
+
+Configuration (env, all optional):
+    PANACEA_SHIM_BIND      bind address       (default 127.0.0.1)
+    PANACEA_SHIM_PORT      bind port          (default 13017)
+    PANACEA_AIGW_URL       default upstream   (used when no route prefix matches)
+    PANACEA_AIGW_ROUTES    optional comma-separated <prefix>=<url> map; the first
+                           segment of the request path picks the upstream, and is
+                           stripped before forwarding. Example:
+                              "cf-stack=http://10.113.24.33:6980,cf-stack-eval=http://10.113.24.33:6981"
+                           A request to /cf-stack/mcp/diamond is forwarded to
+                              http://10.113.24.33:6980/mcp/diamond
+    PANACEA_TICKET_FILE    active-ticket path (default ~/.cursor/active-ticket)
+    PANACEA_TICKET         active ticket env  (fallback when file is empty)
+    PANACEA_SHIM_DEBUG     "1" to emit one stderr line per request
+"""
+from __future__ import annotations
+
+import http.client
+import os
+import socket
+import sys
+import threading
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+# ---------- configuration -----------------------------------------------------
+
+BIND = os.environ.get("PANACEA_SHIM_BIND", "127.0.0.1")
+PORT = int(os.environ.get("PANACEA_SHIM_PORT", "13017"))
+UPSTREAM_URL = os.environ.get("PANACEA_AIGW_URL", "http://10.113.24.33:6980")
+TICKET_FILE = Path(os.environ.get("PANACEA_TICKET_FILE", str(Path.home() / ".cursor" / "active-ticket")))
+DEBUG = os.environ.get("PANACEA_SHIM_DEBUG") == "1"
+
+
+def _parse_routes(raw: str) -> "list[tuple[str, urllib.parse.SplitResult]]":
+    """Parse PANACEA_AIGW_ROUTES into [(prefix, parsed_url), ...]. Invalid
+    entries are skipped with a stderr warning so a misconfigured env var
+    never takes the shim offline."""
+    out = []
+    for chunk in (raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        prefix, url = chunk.split("=", 1)
+        prefix = prefix.strip().strip("/")
+        url = url.strip()
+        parsed = urllib.parse.urlsplit(url)
+        if not prefix or parsed.scheme not in ("http", "https"):
+            print(f"[panacea-baggage-shim] WARN: skipping invalid route {chunk!r}", file=sys.stderr)
+            continue
+        out.append((prefix, parsed))
+    return out
+
+
+_DEFAULT_UPSTREAM = urllib.parse.urlsplit(UPSTREAM_URL)
+if _DEFAULT_UPSTREAM.scheme not in ("http", "https"):
+    sys.exit(f"panacea-baggage-shim: PANACEA_AIGW_URL must be http(s); got {UPSTREAM_URL!r}")
+_ROUTES = _parse_routes(os.environ.get("PANACEA_AIGW_ROUTES", ""))
+
+# Headers we never proxy. `Host` and `Connection` are hop-by-hop or rewritten
+# automatically by http.client; the rest are RFC 7230 hop-by-hop headers that
+# must not be forwarded end-to-end.
+HOP_BY_HOP = {
+    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+    "te", "trailers", "transfer-encoding", "upgrade", "host",
+}
+
+# ---------- helpers ----------------------------------------------------------
+
+
+def active_ticket() -> str | None:
+    """Return the active ticket from the file (preferred) or env, or None.
+
+    Errors reading the file are swallowed: a misconfigured file should never
+    take the IDE offline. Empty/whitespace values count as "no ticket".
+    """
+    try:
+        v = TICKET_FILE.read_text(encoding="utf-8").strip()
+        if v:
+            return v
+    except OSError:
+        pass
+    v = (os.environ.get("PANACEA_TICKET") or "").strip()
+    return v or None
+
+
+def rewrite_baggage(incoming: str | None, ticket: str | None) -> str | None:
+    """Return the baggage header value with `ticket=<id>` set to the active
+    value (or stripped if no active ticket).
+
+    Idempotent: any pre-existing `ticket=...` member is removed first so we
+    never duplicate. Other members (user=, role=, session=, opaque=...) are
+    preserved verbatim, including their order and any property suffixes
+    (W3C baggage members may carry `;k=v` properties after the value).
+    """
+    members: list[str] = []
+    if incoming:
+        for raw in incoming.split(","):
+            m = raw.strip()
+            if not m:
+                continue
+            key = m.split("=", 1)[0].strip().lower()
+            if key == "ticket":
+                continue
+            members.append(m)
+    if ticket:
+        members.append(f"ticket={ticket}")
+    return ",".join(members) if members else None
+
+
+def _filtered_headers(src) -> list[tuple[str, str]]:
+    """Drop hop-by-hop headers; keep everything else verbatim. Returns a
+    list of (name, value) pairs to preserve duplicates (e.g. multiple
+    Set-Cookie)."""
+    out = []
+    for k, v in src.items():
+        if k.lower() in HOP_BY_HOP:
+            continue
+        out.append((k, v))
+    return out
+
+
+def _read_request_body(handler: BaseHTTPRequestHandler) -> bytes:
+    """Read the request body either by Content-Length or chunked TE. Returns
+    empty bytes for methods without a body."""
+    cl = handler.headers.get("Content-Length")
+    if cl is not None:
+        try:
+            n = int(cl)
+        except ValueError:
+            return b""
+        return handler.rfile.read(n) if n > 0 else b""
+    te = handler.headers.get("Transfer-Encoding", "").lower()
+    if "chunked" in te:
+        return _read_chunked(handler.rfile)
+    return b""
+
+
+def _read_chunked(rfile) -> bytes:
+    """Decode a chunked-transfer body. We materialize it (rather than
+    streaming) because the upstream client API expects a complete body for
+    non-SSE POSTs; SSE streaming applies to the response, not the request."""
+    buf = bytearray()
+    while True:
+        line = rfile.readline().strip()
+        if not line:
+            break
+        try:
+            size = int(line.split(b";", 1)[0], 16)
+        except ValueError:
+            break
+        if size == 0:
+            rfile.readline()  # consume the trailing CRLF
+            break
+        buf += rfile.read(size)
+        rfile.readline()  # consume the chunk-trailing CRLF
+    return bytes(buf)
+
+
+# ---------- handler ----------------------------------------------------------
+
+
+class ShimHandler(BaseHTTPRequestHandler):
+    # Silence default per-request access logging; we have our own debug path.
+    def log_message(self, fmt: str, *args) -> None:  # noqa: D401, ARG002
+        return
+
+    server_version = "PanaceaBaggageShim/1.0"
+
+    def _select_upstream(self, request_path: str):
+        """Match the first path segment against PANACEA_AIGW_ROUTES; on a hit,
+        strip that segment and return (upstream_url, rewritten_path). On no
+        match, return the default upstream and the original path unchanged."""
+        if _ROUTES:
+            split = request_path.split("?", 1)
+            path_only = split[0]
+            query = ("?" + split[1]) if len(split) == 2 else ""
+            stripped = path_only.lstrip("/")
+            head, _, tail = stripped.partition("/")
+            for prefix, parsed in _ROUTES:
+                if head == prefix:
+                    return parsed, "/" + tail + query
+        return _DEFAULT_UPSTREAM, request_path
+
+    def _proxy(self) -> None:
+        ticket = active_ticket()
+        baggage_in = self.headers.get("baggage")
+        baggage_out = rewrite_baggage(baggage_in, ticket)
+
+        body = _read_request_body(self)
+
+        # Pick the upstream: try a route-prefix match first, fall back to
+        # the default. Path-prefix routing lets one shim front multiple
+        # gateways (e.g. cf-stack on :6980, cf-stack-eval on :6981) without
+        # running multiple shim instances.
+        upstream, fwd_path = self._select_upstream(self.path)
+
+        # Build the upstream connection. We open one HTTP connection per
+        # request: simpler to reason about, and the IDE issues at most a
+        # handful of MCP requests per second so connection-reuse latency is
+        # not a concern.
+        host = upstream.hostname or "localhost"
+        port = upstream.port or (443 if upstream.scheme == "https" else 80)
+        conn_cls = http.client.HTTPSConnection if upstream.scheme == "https" else http.client.HTTPConnection
+        conn = conn_cls(host, port, timeout=300)
+
+        try:
+            up_headers = _filtered_headers(self.headers)
+            up_headers = [(k, v) for k, v in up_headers if k.lower() != "baggage"]
+            if baggage_out:
+                up_headers.append(("baggage", baggage_out))
+            up_headers.append(("Host", upstream.netloc))
+
+            # If operator points the upstream at a sub-path, prefix it.
+            path = fwd_path
+            if upstream.path:
+                base = upstream.path.rstrip("/")
+                path = base + path
+
+            conn.request(self.command, path, body=body if body else None, headers=dict(up_headers))
+            up = conn.getresponse()
+
+            self.send_response(up.status, up.reason)
+            for k, v in up.getheaders():
+                if k.lower() in HOP_BY_HOP or k.lower() == "content-length":
+                    continue
+                self.send_header(k, v)
+
+            # Stream the response body through. Some MCP backends use SSE
+            # (text/event-stream) which is open-ended; reading in small
+            # chunks keeps memory bounded and forwards the bytes promptly so
+            # the IDE sees streaming results in real time.
+            content_length = up.getheader("Content-Length")
+            if content_length is not None:
+                self.send_header("Content-Length", content_length)
+            else:
+                self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+
+            if content_length is not None:
+                remaining = int(content_length)
+                while remaining > 0:
+                    chunk = up.read(min(remaining, 16384))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+            else:
+                while True:
+                    chunk = up.read(16384)
+                    if not chunk:
+                        # End of chunked stream (empty terminator).
+                        self.wfile.write(b"0\r\n\r\n")
+                        break
+                    self.wfile.write(f"{len(chunk):X}\r\n".encode("ascii"))
+                    self.wfile.write(chunk)
+                    self.wfile.write(b"\r\n")
+            try:
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+
+            if DEBUG:
+                _debug(f"{self.command} {self.path} -> {up.status} (ticket={ticket or '-'})")
+        except (socket.error, http.client.HTTPException, ConnectionError) as exc:
+            self.send_error(502, f"upstream error: {exc}")
+            if DEBUG:
+                _debug(f"{self.command} {self.path} -> 502 ({exc})")
+        finally:
+            conn.close()
+
+    do_GET = do_POST = do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _proxy
+
+
+def _debug(msg: str) -> None:
+    print(f"[panacea-baggage-shim] {msg}", file=sys.stderr, flush=True)
+
+
+def main() -> None:
+    server = ThreadingHTTPServer((BIND, PORT), ShimHandler)
+    server.daemon_threads = True
+    if DEBUG:
+        routes = "; ".join(f"/{p}/* -> {urllib.parse.urlunsplit(u)}" for p, u in _ROUTES) or "(none)"
+        _debug(f"listening on {BIND}:{PORT}; default={UPSTREAM_URL}; routes={routes}; ticket={TICKET_FILE}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        server.shutdown()
+
+
+if __name__ == "__main__":
+    main()

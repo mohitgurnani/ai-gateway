@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  macOS launchd unit for panacea-baggage-shim.
+
+  Install:
+      cp com.panacea.baggage-shim.plist ~/Library/LaunchAgents/
+      launchctl load ~/Library/LaunchAgents/com.panacea.baggage-shim.plist
+
+  Override env (optional):
+      Edit the EnvironmentVariables block below before installing, or
+      `launchctl setenv KEY VALUE` for a one-off, then reload.
+
+  Logs:
+      stderr -> ~/Library/Logs/panacea-baggage-shim.log
+
+  Uninstall:
+      launchctl unload ~/Library/LaunchAgents/com.panacea.baggage-shim.plist
+      rm ~/Library/LaunchAgents/com.panacea.baggage-shim.plist
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.panacea.baggage-shim</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mohit.gurnani/.local/bin/panacea-baggage-shim</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PANACEA_SHIM_BIND</key>
+        <string>127.0.0.1</string>
+        <key>PANACEA_SHIM_PORT</key>
+        <string>13017</string>
+        <!-- Default upstream when no route prefix matches. -->
+        <key>PANACEA_AIGW_URL</key>
+        <string>http://10.113.24.33:6980</string>
+        <!-- Path-prefix routes: /cf-stack/* -> :6980, /cf-stack-eval/* -> :6981.
+             First segment is stripped before forwarding. -->
+        <key>PANACEA_AIGW_ROUTES</key>
+        <string>cf-stack=http://10.113.24.33:6980,cf-stack-eval=http://10.113.24.33:6981</string>
+        <key>PANACEA_SHIM_DEBUG</key>
+        <string>0</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/mohit.gurnani/Library/Logs/panacea-baggage-shim.log</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mohit.gurnani/Library/Logs/panacea-baggage-shim.log</string>
+</dict>
+</plist>

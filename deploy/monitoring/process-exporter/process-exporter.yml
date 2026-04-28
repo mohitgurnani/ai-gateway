@@ -1,0 +1,101 @@
+# process-exporter group definitions for the AI gateway VM.
+#
+# This file is read by the process-exporter container (Phase 5 of the
+# monitoring stack). The exporter walks /proc on the host (we bind-mount
+# /proc:/host/proc:ro) and tags every process into one of the named groups
+# below. Prometheus scrapes the resulting metrics:
+#
+#   namedprocess_namegroup_num_procs
+#   namedprocess_namegroup_num_threads
+#   namedprocess_namegroup_open_filedesc   <-- per-process FD count
+#   namedprocess_namegroup_cpu_seconds_total
+#   namedprocess_namegroup_memory_bytes
+#   namedprocess_namegroup_io_*
+#
+# Why we match on `cmdline` (not `comm`)
+# --------------------------------------
+# The MCPs all run as `python` / `python3` / `node` from the host's
+# perspective, and the AI gateways are built with the binary name `app`
+# (so /proc/<pid>/comm reads "app" for every gateway and content filter).
+# A `comm`-based grouping would lump every MCP under "python" and every
+# gateway under "app", and the dashboard could not separate them. Each
+# entrypoint is distinct in cmdline, so we use cmdline regexes with named
+# capture groups and template the group name with `{{.Matches.Server}}`
+# / `{{.Matches.Port}}` so each instance becomes its own series.
+#
+# Group naming convention
+# -----------------------
+#   gateway:port-<admin-port>     - ai-gateway instances (admin-port differentiates)
+#   content-filter:<variant>      - aigw-content-filter and python-parity filter
+#   mcp:<server>                  - panacea MCP servers (one regex per cmdline shape)
+#   host:<binary>                 - host-resident observability binaries
+#   other:<comm>                  - everything else, kept so totals stay accurate
+#
+# Adding a new MCP: drop a new entry below with a cmdline regex; restart the
+# process-exporter container with `docker compose restart process-exporter`.
+# After ~30s the dashboard's "FDs per MCP" panel auto-picks up the new label.
+
+process_names:
+  # ---- Sidecars and host-resident gateway / observability binaries -------
+  - name: "host:{{.Comm}}"
+    comm:
+      - alertmanager
+      - blackbox_exporter
+      - cadvisor
+      - grafana
+      - node_exporter
+      - otelcol-contrib
+      - prometheus
+      - process-exporter
+
+  # ---- AI Gateway runtimes (binary is named `app`; differentiated by port)
+  - name: "gateway:port-{{.Matches.Port}}"
+    cmdline:
+      - "^/app run .*--admin-port (?P<Port>\\d+)"
+
+  # ---- Content filter sidecars -------------------------------------------
+  # Two flavours: the Go binary `/app --addr :9093 --config ...` and the
+  # python-parity sidecar `/app/.venv/bin/python run.py`.
+  - name: "content-filter:go"
+    cmdline:
+      - "^/app --addr :\\d+ --config /etc/content-filter"
+  - name: "content-filter:python-parity"
+    cmdline:
+      - "/app/\\.venv/bin/python run\\.py"
+
+  # ---- Panacea MCPs by entrypoint binary in cmdline ----------------------
+  # Pattern A: .venv/bin/SOMETHING-mcp[-http] (jita, supportgpt, sourcegraph,
+  # diamond, supergateway, etc.)
+  - name: "mcp:{{.Matches.Server}}"
+    cmdline:
+      - "/\\.venv/bin/(?P<Server>[a-z0-9_-]+?-mcp(?:-http)?)(?:\\s|$)"
+
+  # Pattern B: .venv/bin/mcp-SOMETHING (atlassian and friends prefix mcp-)
+  - name: "mcp:{{.Matches.Server}}"
+    cmdline:
+      - "/\\.venv/bin/(?P<Server>mcp-[a-z0-9_-]+)(?:\\s|$)"
+
+  # Pattern C: python -m panacea_agent.servers.SOMETHING.(server|unified_server)
+  - name: "mcp:{{.Matches.Server}}"
+    cmdline:
+      - "panacea_agent\\.servers\\.(?P<Server>[a-z0-9_]+)\\."
+
+  # Pattern D: python -m nurag.unified_server (top-level nurag pkg)
+  - name: "mcp:nurag-unified-server"
+    cmdline:
+      - "nurag\\.unified_server"
+
+  # Pattern E: python -m mount_app.server (jita-mount-app sidecar)
+  - name: "mcp:jita-mount-app"
+    cmdline:
+      - "mount_app\\.server"
+
+  # Pattern F: glean is a node-based supergateway proxy
+  - name: "mcp:glean-supergateway"
+    cmdline:
+      - "supergateway --stdio local-mcp-server"
+
+  # ---- Catch-all so totals stay accurate ---------------------------------
+  - name: "other:{{.Comm}}"
+    cmdline:
+      - .+

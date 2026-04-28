@@ -1,0 +1,50 @@
+# systemd-user unit for panacea-baggage-shim.
+#
+# Install:
+#     mkdir -p ~/.config/systemd/user
+#     cp panacea-baggage-shim.service ~/.config/systemd/user/
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now panacea-baggage-shim
+#
+# Override env (preferred over editing this unit):
+#     systemctl --user edit panacea-baggage-shim
+#     # add lines like:
+#     # [Service]
+#     # Environment=PANACEA_AIGW_URL=https://aigw.example.com
+#
+# Logs:
+#     journalctl --user -u panacea-baggage-shim -f
+#
+# Uninstall:
+#     systemctl --user disable --now panacea-baggage-shim
+#     rm ~/.config/systemd/user/panacea-baggage-shim.service
+[Unit]
+Description=Panacea baggage-injecting shim for Cursor IDE -> AI Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/panacea-baggage-shim
+Restart=on-failure
+RestartSec=2s
+
+Environment=PANACEA_SHIM_BIND=127.0.0.1
+Environment=PANACEA_SHIM_PORT=13017
+# Default upstream when no route prefix matches.
+Environment=PANACEA_AIGW_URL=http://10.113.24.33:6980
+# Path-prefix routes: /cf-stack/* -> :6980, /cf-stack-eval/* -> :6981.
+# First segment is stripped before forwarding.
+Environment=PANACEA_AIGW_ROUTES=cf-stack=http://10.113.24.33:6980,cf-stack-eval=http://10.113.24.33:6981
+Environment=PANACEA_SHIM_DEBUG=0
+
+# Hardening: the shim only reads ~/.cursor/active-ticket and talks to a
+# single upstream URL; no need for the full home directory or system dirs.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cursor
+
+[Install]
+WantedBy=default.target

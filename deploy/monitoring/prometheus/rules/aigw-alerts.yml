@@ -1,0 +1,122 @@
+# Phase 4 alert rules.
+#
+# Each alert carries:
+#   * severity: "critical" | "warning" (used by Alertmanager routing).
+#   * service:  the logical service it pertains to (used for grouping).
+#   * runbook:  short pointer to the existing runbook in the team wiki / docs.
+groups:
+  - name: aigw-platform
+    interval: 30s
+    rules:
+      - alert: AIGatewayDown
+        expr: up{job=~"aigw-(runtime|eval)"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: ai-gateway
+          runbook: "telemetry-rollout-tracker.md#aigw-down"
+        annotations:
+          summary: "AI Gateway target {{ $labels.instance }} is DOWN"
+          description: "Prometheus has been unable to scrape {{ $labels.job }} ({{ $labels.instance }}) for at least 2 minutes. The gateway container may be crashing, the host may be down, or the /metrics endpoint may be misconfigured."
+
+      - alert: OtelCollectorDown
+        expr: up{job="otel-collector-self"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: otel-collector
+          runbook: "telemetry-rollout-tracker.md#collector-down"
+        annotations:
+          summary: "OTel Collector self-scrape is DOWN"
+          description: "otel-collector-self has been unscrapable for >=2m. Post P3d cutover this means traces and metrics from both gateways are silently being dropped."
+
+      - alert: OtelCollectorExportFailures
+        expr: sum(rate(otelcol_exporter_send_failed_spans_total[5m])) > 0.5
+        for: 5m
+        labels:
+          severity: critical
+          service: otel-collector
+          runbook: "telemetry-rollout-tracker.md#collector-export-failures"
+        annotations:
+          summary: "OTel Collector is failing to export spans (>0.5/s for 5m)"
+          description: "Collector failed-span export rate is {{ $value | humanize }}/s sustained over 5m. Check the otlphttp/langfuse exporter target (Langfuse server reachable? auth header valid? rate-limited?)."
+
+      - alert: OtelCollectorQueueBackpressure
+        expr: |
+          (otelcol_exporter_queue_size / otelcol_exporter_queue_capacity) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+          service: otel-collector
+          runbook: "telemetry-rollout-tracker.md#collector-queue"
+        annotations:
+          summary: "OTel Collector exporter queue >80% full"
+          description: "Exporter {{ $labels.exporter }} queue is at {{ $value | humanizePercentage }}. The downstream (Langfuse) is slower than ingest; spans will start dropping when the queue fills."
+
+      - alert: BlackboxExporterDown
+        expr: up{job="blackbox-exporter"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          service: blackbox-exporter
+          runbook: "telemetry-rollout-tracker.md#blackbox-down"
+        annotations:
+          summary: "Blackbox exporter is DOWN"
+          description: "All MCP backend health probes will be missing while this is down."
+
+  - name: mcp-health
+    interval: 30s
+    rules:
+      # Replaces the standalone mcp-health-monitor.
+      # MCP backend up/down based on /health or /healthz probe success.
+      # We page using the friendly `mcp` label (e.g. "diamond", "atlassian")
+      # instead of the raw host:port. The port is still on the alert as
+      # `{{ $labels.mcp_port }}` for triage, and the bare host:port is on
+      # `{{ $labels.instance }}` if anyone needs it.
+      - alert: MCPBackendDown
+        expr: probe_success{job=~"blackbox-mcp-(health|healthz)"} == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: "{{ $labels.mcp }}"
+          runbook: "telemetry-rollout-tracker.md#mcp-backend-down"
+        annotations:
+          summary: "MCP backend {{ $labels.mcp }} is DOWN"
+          description: "Health probe for `{{ $labels.mcp }}` (port {{ $labels.mcp_port }}, target `{{ $labels.instance }}`) has been failing for >=5m. Connections from the gateway to this backend will time out or 503."
+
+      - alert: MCPBackendSlowProbe
+        expr: probe_duration_seconds{job=~"blackbox-mcp-(health|healthz)"} > 5
+        for: 10m
+        labels:
+          severity: warning
+          service: "{{ $labels.mcp }}"
+          runbook: "telemetry-rollout-tracker.md#mcp-backend-slow"
+        annotations:
+          summary: "MCP backend {{ $labels.mcp }} is slow (probe >5s)"
+          description: "Health probe for `{{ $labels.mcp }}` (port {{ $labels.mcp_port }}, target `{{ $labels.instance }}`) has been taking >5s for >=10m. End-user calls through the gateway are likely timing out."
+
+  - name: traffic-anomalies
+    interval: 30s
+    rules:
+      # Alerts that fire only after the cutover starts producing GenAI metrics.
+      # 'absent_over_time' is intentionally lenient: 30m of total silence on a
+      # post-cutover gateway is suspicious.
+      - alert: AIGatewayNoTraffic30m
+        expr: |
+          (
+            sum by (job) (
+              rate(otelcol_receiver_accepted_spans_total[15m])
+            )
+          ) == 0
+          and
+          (
+            time() - process_start_time_seconds{job="otel-collector-self"}
+          ) > 1800
+        for: 30m
+        labels:
+          severity: warning
+          service: ai-gateway
+          runbook: "telemetry-rollout-tracker.md#no-traffic"
+        annotations:
+          summary: "OTel Collector has accepted zero spans for 30m"
+          description: "Collector has been up >30m but has accepted no spans for the last 15m. Either both gateways are idle (unusual during business hours) or the OTLP path is broken end-to-end."

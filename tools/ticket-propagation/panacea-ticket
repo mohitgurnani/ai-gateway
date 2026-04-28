@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# panacea-ticket -- manage the active triage ticket for Cursor IDE.
+#
+# Cursor IDE's ~/.cursor/mcp.json is static and not reloaded mid-session,
+# so it cannot carry per-session ticket=<id> baggage. The companion
+# panacea-baggage-shim reads this file (or $PANACEA_TICKET) to inject
+# ticket=<id> into outbound MCP traffic. See:
+#   panacea-ai-gateway/docs/ticket-propagation-contract.md
+#
+# Usage:
+#   panacea-ticket set <ID>   # write ID to ~/.cursor/active-ticket
+#   panacea-ticket unset      # clear the active ticket
+#   panacea-ticket show       # print the active ticket (or "(none)")
+
+set -euo pipefail
+
+# Validate that we have an output dir we control.
+TICKET_DIR="${HOME}/.cursor"
+TICKET_FILE="${TICKET_DIR}/active-ticket"
+
+# Recommended canonical shape; we warn but don't reject -- the gateway is
+# also permissive (see ticket-propagation-contract.md §3.2). This keeps
+# the helper usable for ad-hoc IDs in scratch projects.
+TICKET_SHAPE='^[A-Z][A-Z0-9_]+-[0-9]+$'
+
+usage() {
+    # Exit code: 0 when explicitly requested via -h/--help/help, 2 on misuse.
+    local rc="${1:-2}"
+    local out=2
+    [[ "$rc" == 0 ]] && out=1
+    cat <<USAGE >&"$out"
+panacea-ticket -- set/clear/show the active Cursor IDE triage ticket.
+
+Usage:
+  panacea-ticket set <TICKET-ID>
+  panacea-ticket unset
+  panacea-ticket show
+
+Examples:
+  panacea-ticket set ENG-918015     # before triaging
+  panacea-ticket show               # confirm
+  panacea-ticket unset              # when done
+
+The shim at ~/.local/bin/panacea-baggage-shim reads ${TICKET_FILE} (or
+\$PANACEA_TICKET) and adds ticket=<ID> to outbound MCP baggage. See
+panacea-ai-gateway/docs/ticket-propagation-contract.md.
+USAGE
+    exit "$rc"
+}
+
+cmd="${1:-}"
+
+case "$cmd" in
+    set)
+        if [[ $# -lt 2 || -z "${2:-}" ]]; then
+            echo "panacea-ticket: 'set' requires a ticket ID" >&2
+            usage
+        fi
+        ticket="$2"
+        if [[ ! "$ticket" =~ $TICKET_SHAPE ]]; then
+            echo "panacea-ticket: warning: '$ticket' does not match recommended shape ${TICKET_SHAPE} -- continuing anyway" >&2
+        fi
+        mkdir -p "$TICKET_DIR"
+        umask 077
+        printf '%s' "$ticket" > "$TICKET_FILE"
+        echo "panacea-ticket: active ticket set to '$ticket'"
+        ;;
+    unset)
+        rm -f "$TICKET_FILE"
+        echo "panacea-ticket: active ticket cleared"
+        ;;
+    show)
+        if [[ -s "$TICKET_FILE" ]]; then
+            cat "$TICKET_FILE"
+            echo
+        else
+            echo "(none)"
+        fi
+        ;;
+    -h|--help|help)
+        usage 0
+        ;;
+    "")
+        usage 2
+        ;;
+    *)
+        echo "panacea-ticket: unknown command '$cmd'" >&2
+        usage 2
+        ;;
+esac

@@ -31,6 +31,7 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
 	"github.com/envoyproxy/ai-gateway/internal/metrics"
+	"github.com/envoyproxy/ai-gateway/internal/tracing"
 	"github.com/envoyproxy/ai-gateway/internal/tracing/tracingapi"
 	"github.com/envoyproxy/ai-gateway/internal/version"
 )
@@ -199,6 +200,22 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 		applicationError bool
 		result           handlerResult
 	)
+	// Phase A — capture client-network identity (X-Forwarded-For if the
+	// immediate peer is in MCP_TRUSTED_PROXY_CIDRS, otherwise
+	// r.RemoteAddr) onto the request context so the tracing layer can
+	// emit `client.address`, `client.address.kind`, and a fallback
+	// `user.id = "ip:<addr>"` for callers that did not set baggage
+	// `user`. We do this once at the top of the request so every span
+	// kicked off during this handler invocation sees the same value
+	// without re-parsing the request.
+	//
+	// Phase B TODO: remove once Okta-verified identity is the trusted
+	// source for `user.id` and `auth.kind`. See
+	// internal/tracing/clientaddr.go and
+	// docs/telemetry-rollout-tracker.md.
+	if addr, kind := tracing.PickClientAddr(r); kind != "" {
+		ctx = tracing.WithClientAddr(ctx, addr, kind)
+	}
 	defer func() {
 		if m.l.Enabled(ctx, slog.LevelDebug) {
 			m.l.Debug("Completed MCP POST request",
@@ -892,6 +909,14 @@ func (m *mcpRequestContext) proxyResponseBody(ctx context.Context, s *session, w
 					}
 
 					body, _ = jsonrpc.EncodeMessage(msg)
+					// Promote the response payload onto the OTel/MCP
+					// span as Langfuse-native output (input.value /
+					// output.value etc.) before the span is ended in
+					// servePOST's defer block. This is the
+					// application/json fast path; the SSE fallback
+					// path below makes the same call. RecordResponseOutput
+					// is idempotent per span so no duplicate emission.
+					m.recordSpanOutput(msg)
 				}
 				m.recordResponse(ctx, msg)
 			}
@@ -999,6 +1024,12 @@ func (m *mcpRequestContext) proxyResponseBody(ctx context.Context, s *session, w
 							// Check if this is a tools/call response with isError=true
 							responseErrors = append(responseErrors, toolErr)
 						}
+						// SSE path mirror of the JSON fast path: emit
+						// the response payload as Langfuse output on
+						// the in-flight span. Gated on req != nil so
+						// we only emit for the user-initiated request,
+						// not for unrelated server->client SSE events.
+						m.recordSpanOutput(msg)
 					}
 					m.recordResponse(ctx, msg)
 				}
@@ -1148,6 +1179,36 @@ func (m *mcpRequestContext) maybeServerToClientRequestModify(ctx context.Context
 	}
 	msg.ID = newID
 	return nil
+}
+
+// recordSpanOutput promotes the upstream JSON-RPC response payload onto
+// the per-request OTel span as Langfuse-native and OpenInference output
+// attributes. It is a no-op when:
+//   - tracing is disabled or no span was created for this request;
+//   - the response is nil (defensive);
+//   - the response carries no result and no error.
+//
+// For success responses we emit `msg.Result` (the raw JSON of the
+// JSON-RPC `result`) so Langfuse renders the actual tool output in its
+// trace UI. For JSON-RPC error responses we emit the encoded error
+// envelope (`{code, message, data}`) so failure traces still show the
+// remote error verbatim, which is the common debugging case for
+// ENG/ONCALL tickets. The underlying RecordResponseOutput on the span
+// is idempotent, so calling this from both the JSON and SSE response
+// paths (which can both touch the same logical reply) is safe.
+func (m *mcpRequestContext) recordSpanOutput(msg *jsonrpc.Response) {
+	if m == nil || m.currentSpan == nil || msg == nil {
+		return
+	}
+	if len(msg.Result) > 0 {
+		m.currentSpan.RecordResponseOutput([]byte(msg.Result))
+		return
+	}
+	if msg.Error != nil {
+		if raw, err := json.Marshal(msg.Error); err == nil {
+			m.currentSpan.RecordResponseOutput(raw)
+		}
+	}
 }
 
 func (m *mcpRequestContext) recordResponse(ctx context.Context, rawMsg jsonrpc.Message) {
@@ -1711,6 +1772,13 @@ func parseParamsAndMaybeStartSpan[paramType mcp.Params](ctx context.Context, m *
 	}
 
 	span := m.tracer.StartSpanAndInjectMeta(ctx, req, p, headers)
+	// Stash the span on the per-request context so the response path
+	// (proxyResponseBody / SSE relay) can later promote the upstream
+	// `result` payload onto the span as Langfuse output. Doing this in
+	// one central spot avoids touching the dozens of call sites that
+	// invoke parseParamsAndMaybeStartSpan from servePOST. See the
+	// `currentSpan` field on mcpRequestContext for the rationale.
+	m.currentSpan = span
 	return span, nil
 }
 

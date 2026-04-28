@@ -1,0 +1,165 @@
+# Prometheus config for the AI Gateway monitoring stack.
+#
+# Scrape job groups:
+#   1. AI gateway admin/metrics endpoints (host network, already published).
+#   2. Blackbox HTTP probes against core MCPs.
+#   3. otel-collector self-metrics (so we can see queue depth / drops).
+#   4. Alertmanager self-scrape (so notify counters land in Grafana).
+#   5. cAdvisor (per-container CPU/RAM/FDs/network for gateways and MCPs).
+#   6. node-exporter (host-level CPU/RAM/disk/load).
+#   7. process-exporter (per-process FD counts and CPU/memory).
+
+global:
+  scrape_interval: 15s
+  scrape_timeout: 10s
+  external_labels:
+    monitor: aigw-monitoring
+    host: 10.113.24.33
+
+scrape_configs:
+  - job_name: aigw-runtime
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:6067"]
+        labels:
+          gateway: cf-stack
+          role: runtime
+
+  - job_name: aigw-eval
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:6068"]
+        labels:
+          gateway: cf-stack-eval
+          role: eval
+
+  - job_name: otel-collector-self
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["otel-collector:8888"]
+
+  # Core MCP set picked for Phase 2 (matches what the gateway routes to today).
+  #
+  # Each target gets a friendly `mcp` label via per-target `labels:` block. We
+  # also keep the bare `host:port` string as `instance` so existing alerts /
+  # debug queries that use `{{ $labels.instance }}` still work, and `mcp_port`
+  # is extracted via relabel_configs for the same reason. The dashboard
+  # legends now key on `{{mcp}}` (see grafana/dashboards/aigw-overview.json)
+  # so the UI shows "diamond" instead of "host.docker.internal:3001".
+  #
+  # Adding a new MCP: drop a new `- targets: [...]` entry below with its
+  # `mcp:` label and reload Prometheus (`curl -XPOST :9091/-/reload` on the
+  # VM). Grafana picks up the new series automatically.
+  #
+  # Group A: standard /health endpoint.
+  - job_name: blackbox-mcp-health
+    metrics_path: /probe
+    params:
+      module: [http_2xx_health]
+    static_configs:
+      - targets: [http://host.docker.internal:3001/health]
+        labels: {mcp: diamond}
+      - targets: [http://host.docker.internal:3002/health]
+        labels: {mcp: sourcegraph}
+      - targets: [http://host.docker.internal:3003/health]
+        labels: {mcp: jita}
+      - targets: [http://host.docker.internal:3004/health]
+        labels: {mcp: supportgpt}
+      - targets: [http://host.docker.internal:3005/health]
+        labels: {mcp: knowledge-graph}
+      - targets: [http://host.docker.internal:3007/health]
+        labels: {mcp: nurag}
+      - targets: [http://host.docker.internal:3009/health]
+        labels: {mcp: slack}
+      - targets: [http://host.docker.internal:3010/health]
+        labels: {mcp: panacea-mcp}
+      - targets: [http://host.docker.internal:3011/health]
+        labels: {mcp: live-debug}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+      - source_labels: [__param_target]
+        regex: 'http://[^:]+:(\d+)/.*'
+        target_label: mcp_port
+        replacement: '$1'
+
+  # Group B: /healthz endpoint (atlassian).
+  - job_name: blackbox-mcp-healthz
+    metrics_path: /probe
+    params:
+      module: [http_2xx_healthz]
+    static_configs:
+      - targets: [http://host.docker.internal:3008/healthz]
+        labels: {mcp: atlassian}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+      - source_labels: [__param_target]
+        regex: 'http://[^:]+:(\d+)/.*'
+        target_label: mcp_port
+        replacement: '$1'
+
+  # Group C: blackbox-exporter's own metrics.
+  - job_name: blackbox-exporter
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["blackbox:9115"]
+
+
+  # Phase 4: scrape Alertmanager itself so dispatch counters
+  # (alertmanager_notifications_total{integration="slack",...}) become visible
+  # in Grafana. Without this, we have no observability into whether resolved
+  # notifications actually fired downstream.
+  - job_name: alertmanager
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["alertmanager:9093"]
+
+  # Phase 5: per-container metrics (CPU, RAM, FDs, network, FS). Drives the
+  # mcp-usage / aigw-resources Grafana dashboard. We trim the default cAdvisor
+  # cardinality with metric_relabel_configs (the per-cgroup labels explode
+  # series counts otherwise).
+  - job_name: cadvisor
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["cadvisor:8080"]
+    metric_relabel_configs:
+      # Drop the noisy "POD" pause containers (k8s pause sandboxes that
+      # would never appear here, but cAdvisor's metric set includes them
+      # anyway as empty groups; safer to drop them).
+      - source_labels: [name]
+        regex: '/.*/POD/.*'
+        action: drop
+
+  # Phase 5: host-level metrics. node-exporter is intentionally close to
+  # default; we'll layer alerts on top of it later.
+  - job_name: node-exporter
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # Phase 5: per-process FD counts (read from /proc on the host). Pairs
+  # with cAdvisor's container-level container_file_descriptors so the
+  # mcp-usage dashboard can show both "FDs per container" and "FDs per
+  # process within container".
+  - job_name: process-exporter
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["process-exporter:9256"]
+
+# Phase 4: alerting + rule files.
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ['alertmanager:9093']
+
+rule_files:
+  - /etc/prometheus/rules/*.yml
