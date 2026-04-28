@@ -1,0 +1,95 @@
+# otel-collector-contrib passthrough config for Phase 2.
+#
+# Today the gateways still export OTLP directly to Langfuse on
+# 10.48.65.201:4000. This collector is started up in parallel so that, after
+# Phase 3 lands and we flip the gateway env (see ../README.md, "Cutover"),
+# trace shape in Langfuse is identical -- we just route through here.
+#
+# The metrics pipeline is wired now but dormant: gateways currently set
+# OTEL_METRICS_EXPORTER=none. When the cutover flips that to "otlp" the
+# pipeline starts feeding prometheusremotewrite without further config.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+  # Self-observability: collector scrapes its own internal Prometheus metrics
+  # so we can see queue depths, dropped spans, etc. in Grafana.
+  prometheus/self:
+    config:
+      scrape_configs:
+        - job_name: otel-collector
+          scrape_interval: 30s
+          static_configs:
+            - targets: ["0.0.0.0:8888"]
+
+processors:
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 256
+    spike_limit_mib: 64
+  batch:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 2s
+  # Tag every span/metric with what host it came from so the dashboards can
+  # tell apart the runtime vs eval gateway even before deployment.environment
+  # resource attrs are set.
+  resource:
+    attributes:
+      - key: collector.host
+        value: 10.113.24.33
+        action: upsert
+
+exporters:
+  otlphttp/langfuse:
+    endpoint: http://10.48.65.201:4000/api/public/otel
+    headers:
+      Authorization: "Basic ${LANGFUSE_AUTH_B64}"
+    encoding: proto
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 1000
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 30s
+      max_elapsed_time: 5m
+  prometheusremotewrite:
+    endpoint: http://prometheus:9090/api/v1/write
+    tls:
+      insecure: true
+    resource_to_telemetry_conversion:
+      enabled: true
+  # Keep a debug exporter wired but not enabled; flip into a pipeline by hand
+  # for short troubleshooting sessions.
+  debug:
+    verbosity: basic
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, zpages]
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      level: detailed
+      address: 0.0.0.0:8888
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, resource, batch]
+      exporters: [otlphttp/langfuse]
+    metrics:
+      receivers: [otlp, prometheus/self]
+      processors: [memory_limiter, resource, batch]
+      exporters: [prometheusremotewrite]

@@ -1,0 +1,44 @@
+# Blackbox-exporter modules for Phase 2 MCP probing.
+# - http_2xx_health: standard /health -> 200 (used by most panacea MCPs).
+# - http_2xx_healthz: /healthz -> 200 (used by atlassian).
+# - mcp_tools_list: POST /mcp with JSON-RPC tools/list, expect 200 and a
+#   "tools" key in the response body. Useful for streamable-HTTP MCPs that
+#   don't expose /health.
+
+modules:
+  http_2xx_health:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+      fail_if_body_not_matches_regexp: []
+
+  http_2xx_healthz:
+    prober: http
+    timeout: 5s
+    http:
+      method: GET
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+
+  mcp_tools_list:
+    prober: http
+    timeout: 8s
+    http:
+      method: POST
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      headers:
+        Content-Type: application/json
+        Accept: application/json, text/event-stream
+      body: '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+      fail_if_body_not_matches_regexp:
+        - '"tools"\s*:\s*\['
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false

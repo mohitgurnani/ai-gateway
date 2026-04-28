@@ -5,7 +5,7 @@ gateway (Envoy AI Gateway fork) running on `10.113.24.33`. Update the
 status emoji + the per-task checkbox as work moves; do not delete
 historical sections, add new ones as new phases come up.
 
-| Last updated | 2026-04-27 (P3f Phase A live in both gateways post-redeploy; image `c66853854e4f`) |
+| Last updated | 2026-04-27 (P5 resource-usage observability + Slack resolved-path fix) |
 |---|---|
 | Maintainer | Mohit Gurnani |
 | Source-of-truth plans | `aigw-otel-langfuse-followups_e274c333.plan.md`, `address_sohham_pr_feedback_b59bf117.plan.md`, `aigw-phase2-monitoring-stack_ef46ce8e.plan.md` |
@@ -13,6 +13,7 @@ historical sections, add new ones as new phases come up.
 | Langfuse VM | `10.48.65.201:4000` |
 | Active gateway image | `local/ai-gateway-cli:cf-stack` (sha `c66853854e4f`) rebuilt 2026-04-27 22:15:16 UTC from `mohit/otel-langfuse-native-attrs` head `90bac66d` (P3f Phase A) — both `aigw-cf-stack-gateway` and `aigw-cf-stack-eval-gateway` recreated against this image at 22:16:37 UTC and report `(healthy)`. Replaces the prior `edcd0cfcae5e` image. |
 | Active OTLP path | gateway → `otel-collector-contrib` (`:4328`) → Langfuse (P3d cutover live as of 2026-04-27 ~20:13 UTC; P3e input/output payloads now flow through the same pipe) |
+| Repo home for monitoring stack | `panacea-ai-gateway/deploy/monitoring/` ([PR #12](https://github.com/nutanix-core/panacea-ai-gateway/pull/12) `mohit/aigw-monitoring-stack` + [PR #13](https://github.com/nutanix-core/panacea-ai-gateway/pull/13) `mohit/aigw-monitoring-dashboards`, both stacked on PR #10) |
 
 ## At-a-glance status
 
@@ -27,7 +28,9 @@ historical sections, add new ones as new phases come up.
 | P3e | Capture MCP CallTool / GetPrompt / ReadResource input + JSON-RPC response output as Langfuse-native `input.value` / `output.value` (fix empty trace I/O) | DONE | Mohit | [PR #11](https://github.com/nutanix-core/panacea-ai-gateway/pull/11) — branch `mohit/lf-input-output-capture` (commit `f796f6c9`, stacked on PR #10) |
 | P3f | Phase A: capture `client.address` / `client.address.kind` / `auth.kind` and fall `user.id` back to `"ip:<addr>"` when no baggage `user` (Phase B sunset wired in once Okta lands) | DONE | Mohit | [PR #10](https://github.com/nutanix-core/panacea-ai-gateway/pull/10) — branch `mohit/otel-langfuse-native-attrs` (Phase A commit on top of `ad29a7a7`) |
 | P4 | Alertmanager + alert rules + native Slack webhook, retire `mcp-health-monitor` | DONE | Mohit | host: `~/aigw-monitoring-stack/{alertmanager,prometheus/rules}/`. `severity=critical|warning` routes both fire into `#panacea-mcp-monitoring` via Alertmanager's native `slack_configs` using a Slack Incoming Webhook URL stored as a chmod-644 bind-mounted secret (`alertmanager/secrets/slack_webhook_url`). Message template mirrors the retired `mcp-health-monitor` format (`:large_orange_diamond:` / `:rotating_light:` / `:white_check_mark:` + `Server / Level / Error / Since` block). Legacy `mcp-health-monitor` `docker rm`'d 2026-04-27; the interim `slack-relay` Flask sidecar was also retired the same day once the webhook URL became available. |
-| P5 | OTel Collector hardening (PII redaction processor, fan-out to Tempo/Jaeger if needed) | NOT STARTED | unowned | n/a |
+| P4a | Slack `RECOVERED` notification path — `group_interval` lowered from `5m` → `1m` so resolved messages land within ~90s of an alert clearing | DONE | Mohit | [PR #12](https://github.com/nutanix-core/panacea-ai-gateway/pull/12) — branch `mohit/aigw-monitoring-stack` (`alertmanager/alertmanager.yml`). End-to-end validation: explicit-resolve push → counter `alertmanager_notifications_total{integration="slack"}` ticks twice (firing + resolved). |
+| P5 | Resource-usage observability stack (cAdvisor + node-exporter + process-exporter) + new "MCP & Gateway Resource Usage" Grafana dashboard mirroring the layout of `~eng/panacea-ai-analysis/mcp_usage_dashboard.html` | DONE | Mohit | [PR #12](https://github.com/nutanix-core/panacea-ai-gateway/pull/12) `mohit/aigw-monitoring-stack` (compose + scrape jobs + process-exporter group rules) and [PR #13](https://github.com/nutanix-core/panacea-ai-gateway/pull/13) `mohit/aigw-monitoring-dashboards` (`grafana/dashboards/mcp-usage.json`). Adds per-MCP CPU/RAM/FD/network/restart panels driven by 22 `process-exporter` cmdline-keyed groups (12 MCPs + 3 gateways + 2 content filters + sidecars). |
+| P6 | OTel Collector hardening (PII redaction processor, fan-out to Tempo/Jaeger if needed) | NOT STARTED | unowned | n/a (was P5 — renumbered after P5 resource-usage work shipped) |
 
 Legend: DONE / IN PROGRESS / NOT STARTED / BLOCKED.
 
@@ -604,9 +607,126 @@ Concretely shipped:
       consider rotating the Slack Incoming Webhook URL into a real
       secret store (Vault / SOPS) once one is available on this host.
 
-## Phase 5 — Collector hardening (NOT STARTED)
+## Phase 4a — Slack `RECOVERED` path validated (DONE)
 
-Stretch goals once P2 is in steady state and P4 is retiring legacy paths.
+Follow-up to P4 after the user reported "I did not see resolved
+notification in Slack yet." The original `alertmanager.yml` had
+`group_interval: 5m`, which delays the *follow-up* notification — and
+that's exactly the dispatch slot Alertmanager uses to send
+`send_resolved` messages. Operators routinely close their Slack window
+inside that 5-minute gap, so the resolved page felt invisible even
+though it was technically being sent.
+
+- [x] `group_interval` lowered from `5m` → `1m` in
+      `deploy/monitoring/alertmanager/alertmanager.yml` (matches the
+      perceived UX of the retired `mcp-health-monitor`).
+- [x] End-to-end validation on the live VM: pushed a synthetic alert
+      `DashboardSmokeTestV2` with `endsAt` 30s in the future, then
+      explicitly resolved it (`endsAt` in the past). The Prometheus
+      counter `alertmanager_notifications_total{integration="slack"}`
+      ticked twice (`21 → 22` within ~90s), confirming both the firing
+      and the `RECOVERED` block reach `#panacea-mcp-monitoring`.
+- [x] Inline comments in `alertmanager.yml` explain why `group_interval`
+      is intentionally tighter than vanilla Alertmanager defaults so
+      the next reviewer doesn't bump it back without thinking.
+
+## Phase 5 — Resource-usage observability (DONE)
+
+Direct follow-up to "our Grafana dashboard does not have CPU/RAM/FDs
+for our MCP/gateway containers — design something like
+`~eng/panacea-ai-analysis/mcp_usage_dashboard.html`." Adds three new
+exporters to the stack and a brand-new Grafana dashboard that mirrors
+that layout against locally-scraped metrics.
+
+### What got added
+
+| Component | Image | Port | Role |
+|---|---|---|---|
+| `cadvisor` | `gcr.io/cadvisor/cadvisor:v0.51.0` | host `8085` | per-container CPU / memory / network / FS / restart count, scoped to all Docker containers on the VM. v0.51.0 (not v0.49.x) is required because earlier versions miss the cgroup-v2 + systemd driver paths used on Ubuntu 24.04 — they show "no container info" on this host. The compose service mounts `/run/containerd/containerd.sock` so cAdvisor resolves container metadata against the runtime actually in use. |
+| `node-exporter` | `prom/node-exporter:v1.8.2` | host `9100` | host-level CPU / memory / load / disk / processes. Configured with `--path.rootfs=/host` to read host stats through the bind mount. |
+| `process-exporter` | `ncabatoff/process-exporter:0.8.7` | host `9256` | per-process FD count + CPU + memory grouped by `cmdline` regex. This is how we get **per-MCP open file descriptors** even though every MCP runs as `python` from the host's `/proc` view. |
+
+### Why three exporters and not just cAdvisor
+
+cAdvisor v0.51.0 dropped the `container_file_descriptors` metric (it was
+never reliable across cgroup-v2 distros). The user's "FDs per MCP" ask
+maps directly onto `namedprocess_namegroup_open_filedesc` from
+process-exporter, so we keep cAdvisor for container CPU/RAM/network
+(which it does well) and use process-exporter to back-fill FD counts
+plus per-process CPU%/memory.
+
+### `process-exporter` group naming convention
+
+All groups use `cmdline` regexes (not `comm`) because every MCP runs
+under `python`/`python3`/`node` and the gateways all run as `app` —
+`comm`-based grouping would lump everything together. The convention is:
+
+| Group | Examples | Source pattern |
+|---|---|---|
+| `gateway:port-<admin-port>` | `gateway:port-6067`, `gateway:port-6068`, `gateway:port-6065` | `^/app run .*--admin-port (?P<Port>\d+)` |
+| `content-filter:<variant>` | `content-filter:go`, `content-filter:python-parity` | `^/app --addr :\d+ --config /etc/content-filter` and `/app/\.venv/bin/python run\.py` |
+| `mcp:<server>` | `mcp:jita-mcp`, `mcp:mcp-atlassian`, `mcp:nurag-unified-server`, `mcp:glean-supergateway`, `mcp:diamond-mcp-http`, `mcp:supportgpt-mcp`, … | one regex per cmdline shape — `.venv/bin/<name>-mcp[-http]`, `.venv/bin/mcp-<name>`, `python -m panacea_agent.servers.<name>.*`, `python -m nurag.unified_server`, `node ... supergateway --stdio`, `python -m mount_app.server` |
+| `host:<binary>` | `host:alertmanager`, `host:prometheus`, `host:grafana`, `host:cadvisor`, `host:node_exporter`, `host:otelcol-contrib`, `host:blackbox_exporter`, `host:process-exporter` | `comm`-keyed |
+| `other:<comm>` | `other:python`, `other:bash`, … | catch-all so totals stay accurate |
+
+Adding a new MCP: drop a new entry into
+`deploy/monitoring/process-exporter/process-exporter.yml`, restart the
+`process-exporter` container, and the dashboard auto-picks up the new
+label inside ~30 seconds.
+
+### `mcp-usage` Grafana dashboard
+
+UID `aigw-mcp-usage`, slug
+`/d/aigw-mcp-usage/mcp-and-gateway-resource-usage`. Layout mirrors the
+diamond reference page, top-to-bottom:
+
+1. **Host overview** (6 stat panels): host CPU%, host RAM%, load1,
+   total host FDs (sum of `namedprocess_namegroup_open_filedesc`),
+   containers up, host rootfs disk%.
+2. **Per-container CPU & memory (sortable)** — single table, columns
+   `CPU %` (rate over 1m), `Memory` (working set), `Restarts (24h)`,
+   `Net RX/s`, `Net TX/s`. We use `Restarts (24h)` (delta of
+   `container_start_time_seconds`) instead of `container_processes` /
+   `container_tasks_state` because both are unreliable on cgroup-v2 and
+   read as zero for healthy containers.
+3. **MCP container resource usage** — 4 timeseries: CPU%, working-set
+   memory, **per-process-group open FDs**, network throughput. The FD
+   panel is sourced from `process-exporter`
+   (`namedprocess_namegroup_open_filedesc{groupname=~"mcp:.+|gateway:.+|content-filter:.+"}`)
+   so each MCP keeps its own line even when colocated in the same
+   container.
+4. **Tool-call traffic by MCP backend (gateway view)** — same data as
+   the AI-Gateway-Overview dashboard but split per `mcp_backend` label:
+   req/s, p95 latency, error rate, top tool methods (1h table). This
+   ties the resource view back to the Langfuse-native attrs from PR #10.
+5. **Process-level FDs (per process group)** — three timeseries
+   stitching it all together: all groups except `other:`, `topk(15)`
+   per-MCP FDs (capacity-planning view), and per-MCP CPU% computed
+   from `rate(namedprocess_namegroup_cpu_seconds_total[2m])`.
+
+The dashboard also includes two top-of-page links: one back to the
+AI-Gateway-Overview dashboard, one to the Langfuse traces UI, so an
+operator who spots a resource spike can pivot straight into the
+trace-level view without leaving Grafana.
+
+### Validation
+
+- All 22 `process-exporter` groups (12 MCPs + 3 gateways + 2 content
+  filters + 5 host services) are present in
+  `namedprocess_namegroup_num_procs`. No process is dropped to the
+  catch-all `other:*` bucket beyond what's expected (kernel threads,
+  short-lived helpers).
+- `cadvisor` reports working-set memory and CPU rate for every named
+  container (`name=~"panacea-.*|aigw-.*"`).
+- The new dashboard renders 18 non-row panels with live data; full
+  screenshot captured at
+  `panacea-ingestion-pipeline/.playwright-mcp/mcp-usage-dashboard-v4-{top,mid}.png`.
+
+## Phase 6 — Collector hardening (NOT STARTED)
+
+Stretch goals once P2 is in steady state and P4/P5 are retiring legacy
+paths. (Was originally numbered Phase 5 — renumbered after the P5
+resource-usage work above shipped.)
 
 - [ ] PII redaction `transform` processor on the traces pipeline (drop/hash sensitive prompt content per policy)
 - [ ] Fan-out exporter: keep `otlphttp/langfuse` + add `otlp/tempo` (or `jaeger`) for raw-span exploration in cases Langfuse's UI hides
@@ -631,6 +751,10 @@ Stretch goals once P2 is in steady state and P4 is retiring legacy paths.
 | Local OTel Collector OTLP gRPC | `10.113.24.33:4327` | available; gateways currently use the HTTP path |
 | SigNoz collector OTLP gRPC/HTTP | `10.113.24.33:4317`/`:4318` | pre-existing, untouched |
 | Langfuse dashboard "ai-gateway" | `http://10.48.65.201:4000/project/cmmtgs957001tlb07m0t95u6a/dashboards/cmohddu5o0009lb07k127lwo6` | 13 widgets; filter `Tags = ticket:<ID>` for per-ticket views |
+| Grafana dashboard "MCP & Gateway Resource Usage" | `http://10.113.24.33:3030/d/aigw-mcp-usage/mcp-and-gateway-resource-usage` | P5 — host overview, per-container CPU/RAM/restarts/network, per-MCP FDs/CPU%, tool-call rate/p95/errors |
+| cAdvisor | `http://10.113.24.33:8085/metrics` | P5; per-container metrics |
+| node-exporter | `http://10.113.24.33:9100/metrics` | P5; host-level metrics |
+| process-exporter | `http://10.113.24.33:9256/metrics` | P5; per-process FD counts grouped by cmdline |
 
 ## Reusable runbooks / commands
 
@@ -926,3 +1050,4 @@ Grep `Phase B TODO` in this repo to find every touchpoint.
 | 2026-04-27 | **P3f — Phase A redeployed live to both gateways on `10.113.24.33`.** Synced VM source tree at `/home/nutanix/Desktop/mohit/cf-deploy/ai-gateway` to `mohit/otel-langfuse-native-attrs` head `90bac66d` (the PR #11 working-tree patch on the VM was a no-op against the now-merged remote, so a `git stash --include-untracked` + `git reset --hard` was clean). Rebuilt the image with `make docker-build.aigw OCI_REGISTRY=local TAG=cf-stack DOCKER_BUILD_ARGS=--load` — produced `local/ai-gateway-cli:cf-stack` sha `c66853854e4f` (build log at `/tmp/aigw-phaseA-build-20260427T221455Z.log`). Spot-checked the binary: `strings /app | grep -E "PickClientAddr\|WithClientAddr\|client\.address\|auth\.kind\|MCP_TRUSTED_PROXY_CIDRS"` finds all five plus the `clientaddr.go` source path. `/tmp/redeploy-gateways-iofix.sh` recreated both 6980 + 6981 containers in 11s; both report `(healthy)`, both pinned to image `c66853854e4f`. **Live verification (`/tmp/aigw-phaseA-smoke.sh`)**: drove two `tools/list` waves through the runtime gateway from `127.0.0.1` and queried Langfuse public API for the resulting traces. (a) Wave with full baggage `ticket=ENG-PHASEA-DEPLOY-BAGGAGE-…,user=phaseA-smoke@nutanix.com,role=engineer` produced trace `a153f7b6…` with `auth.kind=baggage`, `user.id=phaseA-smoke@nutanix.com`, **and** `client.address=127.0.0.1` / `client.address.kind=remote_addr` recorded for audit even though baggage won — exactly the precedence rule we wired in. (b) Wave with only a ticket marker (no `user`/`role` baggage) produced trace `b225f0a0…` with `auth.kind=ip`, `user.id=ip:127.0.0.1`, `client.address=127.0.0.1`, `client.address.kind=remote_addr` — proves the IP fallback for untagged callers. Both Langfuse trace `userId` columns now reflect identity end-to-end (handler → context → tracer → OTel collector → Langfuse). No anonymous-path test driven from a real HTTP request (covered by unit tests; impossible to trigger without subverting `r.RemoteAddr`). The `MCP_TRUSTED_PROXY_CIDRS` knob was deliberately left unset on the VM (no L7 proxy fronts the gateway), so XFF is correctly ignored. |
 | 2026-04-27 | **P3f — Phase A: client-network identity fallback for `user.id` (`mohit/otel-langfuse-native-attrs`, stacked on PR #10).** User asked: "if we have Okta later, would we get the actual user via Okta? And if a caller doesn't set the static baggage, can we use IP instead to track volume / audit / rate-limit?" Phase A says yes to part two (and pre-stages the Phase B sunset for part one). Added `internal/tracing/clientaddr.go` with `PickClientAddr(*http.Request)` (XFF leftmost when peer is in `MCP_TRUSTED_PROXY_CIDRS`, else `RemoteAddr`) + `WithClientAddr(ctx, addr, kind)` context plumbing. `internal/mcpproxy/handlers.go::servePOST` now stashes the captured address on the request context once at request start. `internal/tracing/mcp.go::StartSpanAndInjectMeta` reads it back and emits three new attrs: `auth.kind` (always — `baggage` / `ip` / `anonymous`), `client.address` (canonical IP), `client.address.kind` (`xff` / `remote_addr`). When no baggage `user` is set, `user.id` is filled with the literal `"ip:<addr>"` so per-user dashboards keep bucketing untagged callers. Baggage user wins over IP; if both are present, `auth.kind=baggage`, `user.id` = baggage value, and the IP is recorded only as `client.address` for audit. PII contract: gateway is internal-only on `10.113.24.33`, IPs are RFC1918 — recording accepted; if exposed externally, scrub at the OTel Collector. New env knob `MCP_TRUSTED_PROXY_CIDRS` — comma-separated CIDRs (bare IPs accepted as `/32`/`/128` shortcuts), default empty (correct for current deployment). All Phase B sunset paths are flagged with `Phase B TODO:` comments in-line so the Okta migration is mechanical. Tests: 4 new tests in `mcp_test.go` (`AuthKindBaggage`, `AuthKindIP`, `AuthKindAnonymous`, `BaggageBeatsIP`) + a full unit-test file `clientaddr_test.go` (RemoteAddr / IPv6 / XFF trusted / XFF ignored when untrusted / bare-IP CIDR / garbage XFF / context round-trip). `go vet ./...`, `go build ./...`, `go test ./internal/tracing/... ./internal/mcpproxy/...` all pass. Added "Phase A vs Phase B" section above so future readers see the migration plan inline. |
 | 2026-04-27 | **P3e — Capture MCP CallTool input/output for Langfuse (`mohit/lf-input-output-capture`, [PR #11](https://github.com/nutanix-core/panacea-ai-gateway/pull/11)).** User flagged that the Input/Output panels in Langfuse traces (e.g. `diamond` MCP) were empty even though PR-#10 native attrs were landing. Diagnosis: `getMCPParamsAsAttributes` only emitted tool/prompt/resource names, never `params.Arguments`; and `MCPSpan.EndSpan()` was called before `proxyResponseBody` decoded the JSON-RPC result, so there was no live span to write `output.value` on. Fix shipped on commit `f796f6c9` stacked on top of PR #10: (1) `tracingapi.MCPSpan` extended with `RecordResponseOutput([]byte)` (one-shot, truncates, dual-emits Langfuse + OpenInference output attrs); (2) `internal/tracing/mcp.go` JSON-encodes `Arguments`/`URI`, truncates to 8 KiB, dual-emits `langfuse.observation.input` + `input.value` + `input.mime_type`; (3) `internal/mcpproxy/mcpproxy.go` adds `currentSpan` to the request context; (4) `internal/mcpproxy/handlers.go` stashes the span at `parseParamsAndMaybeStartSpan` and a new `recordSpanOutput(*jsonrpc.Response)` helper is invoked from both the JSON and the SSE response paths inside `proxyResponseBody` (matters for `atlassian`/`slack` which only respond via SSE); (5) tests: `mcp_test.go` extended for input attrs on `CallTool`/`GetPrompt`/`ReadResource`, `mcpproxy_test.go::fakeSpan` captures every `RecordResponseOutput` invocation. Built on the VM (`make docker-build.aigw`), redeployed both gateways via `/tmp/redeploy-gateways-iofix.sh` (preserves env/port/volume), drove `nurag` + `supportgpt` + `diamond` `CallTool` waves with `baggage: ticket=ENG-LF-IO-VERIFY,user=mohit,role=engineer`. Verification: Langfuse public API now returns non-null `input`/`output` for those traces (was `null` pre-fix); UI Input/Output panels render JSON; Tags-filter walkthrough (sidebar → expand Tags → type `ticket` → click `ticket:ENG-LF-IO-VERIFY`) narrows traces list to exactly the 6 rows from the verification wave; dashboard `cmohddu5o0009lb07k127lwo6` widgets all populate fresh data with no regression. Screenshots saved under `panacea-ingestion-pipeline/.playwright-mcp/lf_*` (trace detail, traces-filtered-by-ticket, dashboard top/mid/low/bottom). |
+| 2026-04-27 | **P4a + P5 — Slack `RECOVERED` fix and resource-usage observability landed ([PR #12](https://github.com/nutanix-core/panacea-ai-gateway/pull/12) `mohit/aigw-monitoring-stack` + [PR #13](https://github.com/nutanix-core/panacea-ai-gateway/pull/13) `mohit/aigw-monitoring-dashboards`, both stacked on PR #10).** Two follow-ups in one push: (1) **Slack resolved-path fix** — user reported "I did not see resolved notification in Slack yet." Diagnosis: `group_interval: 5m` in `alertmanager.yml` was the dispatch slot Alertmanager uses for `send_resolved` follow-ups; the message was technically being sent but operators close Slack inside the 5-minute gap. Lowered `group_interval` to `1m` (matching the retired `mcp-health-monitor`'s perceived UX). End-to-end validation on the live VM: pushed synthetic `DashboardSmokeTestV2` then explicit-resolved it, the counter `alertmanager_notifications_total{integration="slack"}` ticked twice (`21 → 22` within 90s) — confirming both firing and `RECOVERED` reach `#panacea-mcp-monitoring`. (2) **Resource-usage observability** — added three exporters and a brand-new Grafana dashboard mirroring `~eng/panacea-ai-analysis/mcp_usage_dashboard.html` against locally-scraped data: `cadvisor:v0.51.0` (per-container CPU/RAM/network/restarts; v0.51.0 is mandatory because v0.49.x misses cgroup-v2+systemd paths on Ubuntu 24.04, and we mount `/run/containerd/containerd.sock` so it resolves runtime metadata), `node-exporter:v1.8.2` (host CPU/RAM/load/disk), and `process-exporter:0.8.7` (per-process FD count grouped by cmdline regex — this is how we get **per-MCP file descriptors** even though every MCP runs as `python` from the host's view). 22 process-exporter groups in production: 12 MCPs (`mcp:jita-mcp`, `mcp:mcp-atlassian`, `mcp:nurag-unified-server`, `mcp:glean-supergateway`, `mcp:diamond-mcp-http`, `mcp:supportgpt-mcp`, `mcp:knowledge_graph`, `mcp:live_debug_mcp`, `mcp:panacea_mcp`, `mcp:jita-mount-app`, `mcp:slack-mcp`, `mcp:sourcegraph-mcp-http`) + 3 gateways (`gateway:port-6065/6067/6068`) + 2 content filters (`content-filter:go`, `content-filter:python-parity`) + 5 host services. New `mcp-usage` Grafana dashboard (`uid=aigw-mcp-usage`) lays out 18 non-row panels in the diamond reference order: 6-stat host overview → sortable per-container CPU/Memory/Restarts/RX/TX table → 4 MCP-container timeseries (CPU, working-set memory, per-group FDs, network) → 4 tool-call panels split by `mcp_backend` (rate/p95/errors/top-methods) ← ties resource view back to PR #10's Langfuse-native attrs → 3 process-group FD timeseries (all groups, top-15 per-MCP, per-MCP CPU%). Picked Grafana-only (no Langfuse change) because Prometheus already has every metric we need and the user wanted "FDs per MCP" which is a `/proc`-level question Langfuse doesn't answer. Dashboard chooses `Restarts (24h)` over `container_processes`/`container_tasks_state` because both read zero for healthy containers on cgroup-v2; chooses `process-exporter` over the dropped `container_file_descriptors` cAdvisor metric for FD counts. Dashboard top-of-page links jump back to the AI-Gateway-Overview dashboard and the Langfuse traces UI for trace-level pivot. Validation: 18 panels render with live data on the running VM, all 22 process-exporter groups report non-zero `num_procs`/`open_filedesc`, no MCP falls to the `other:*` bucket. Screenshots: `panacea-ingestion-pipeline/.playwright-mcp/mcp-usage-dashboard-v4-{top,mid}.png`. Repo home: `panacea-ai-gateway/deploy/monitoring/` (compose, prometheus rules + scrape jobs, alertmanager, otel-collector, blackbox, process-exporter group rules, README, .env.example, secret-file `.gitignore`). PRs: `mohit/aigw-monitoring-stack` (everything except dashboards) targeting PR #10's branch + `mohit/aigw-monitoring-dashboards` (`grafana/dashboards/{aigw-overview,mcp-usage}.json`) targeting the stack branch — explicit two-step stack so each PR is a coherent review unit. |
