@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# panacea-ledger — query Langfuse for every MCP/LLM call tagged with a given ticket.
+#
+# This is the canonical "MCP ledger" CLI: it wraps the Langfuse Public API
+# /api/public/observations endpoint with the `tags=ticket:<ID>` filter that the
+# AI gateway promotes from W3C baggage (see panacea-ai-gateway/docs/ticket-propagation-contract.md).
+#
+# Required env:
+#   LANGFUSE_PUBLIC_KEY   project public key (from Langfuse → Settings → API keys)
+#   LANGFUSE_SECRET_KEY   project secret key
+#
+# Optional env:
+#   LANGFUSE_HOST         default: http://10.48.65.201:4000
+#   LANGFUSE_LIMIT        default: 200
+#   LANGFUSE_LEVEL        observations | traces  (default: observations)
+#                         observations = every span (one row per MCP/LLM call)
+#                         traces       = trace headers only (one row per inbound call chain)
+#
+# Usage:
+#   panacea-ledger ENG-918015              # human-readable summary
+#   panacea-ledger ENG-918015 --json       # raw JSON (for jq pipelines)
+#   panacea-ledger ENG-918015 --count      # just the call count
+
+set -euo pipefail
+
+LANGFUSE_HOST="${LANGFUSE_HOST:-http://10.48.65.201:4000}"
+LANGFUSE_LIMIT="${LANGFUSE_LIMIT:-200}"
+LANGFUSE_LEVEL="${LANGFUSE_LEVEL:-observations}"
+
+usage() {
+  cat <<'EOF'
+usage: panacea-ledger <TICKET-ID> [--json|--count]
+
+  TICKET-ID    e.g. ENG-918015, ONCALL-22386, TH-19173
+  --json       emit raw Public API JSON (no jq, no formatting)
+  --count      print only the number of matching observations
+  -h, --help   this help
+
+env:
+  LANGFUSE_PUBLIC_KEY    (required)
+  LANGFUSE_SECRET_KEY    (required)
+  LANGFUSE_HOST          (default: http://10.48.65.201:4000)
+  LANGFUSE_LIMIT         (default: 200)
+  LANGFUSE_LEVEL         observations | traces  (default: observations)
+EOF
+}
+
+if [[ $# -lt 1 || "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && exit 0 || exit 2
+fi
+
+TICKET="$1"
+shift || true
+MODE="pretty"
+case "${1:-}" in
+  --json)  MODE="json" ;;
+  --count) MODE="count" ;;
+  "")      ;;
+  *)       echo "unknown flag: $1" >&2; usage >&2; exit 2 ;;
+esac
+
+if [[ -z "${LANGFUSE_PUBLIC_KEY:-}" || -z "${LANGFUSE_SECRET_KEY:-}" ]]; then
+  echo "error: LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set" >&2
+  exit 1
+fi
+
+if ! command -v jq >/dev/null 2>&1 && [[ "$MODE" != "json" ]]; then
+  echo "error: jq is required for pretty/count output (brew install jq); use --json to bypass" >&2
+  exit 1
+fi
+
+# We rely on the fact that the AI gateway promotes baggage `ticket=<x>` to a
+# Langfuse `tags` entry of the literal form `ticket:<x>` (see mcp.go appendTags).
+TAG="ticket:${TICKET}"
+
+case "$LANGFUSE_LEVEL" in
+  observations) ENDPOINT="/api/public/observations" ;;
+  traces)       ENDPOINT="/api/public/traces" ;;
+  *)            echo "error: LANGFUSE_LEVEL must be 'observations' or 'traces'" >&2; exit 2 ;;
+esac
+
+# `tags` accepts repeated values; we just pass one. URL-encode the colon to be safe.
+URL="${LANGFUSE_HOST}${ENDPOINT}?tags=${TAG//:/%3A}&limit=${LANGFUSE_LIMIT}"
+
+tmp_body="$(mktemp -t panacea-ledger.XXXXXX)"
+trap 'rm -f "$tmp_body"' EXIT
+http_code="$(curl -sS -u "${LANGFUSE_PUBLIC_KEY}:${LANGFUSE_SECRET_KEY}" -m 30 -o "$tmp_body" -w '%{http_code}' "$URL")" || {
+  echo "error: failed to call $URL" >&2
+  exit 1
+}
+resp="$(cat "$tmp_body")"
+
+if [[ "$http_code" != 2* ]]; then
+  echo "error: Langfuse Public API returned HTTP ${http_code}" >&2
+  # Surface the JSON message if present, fall back to first 200 bytes.
+  if command -v jq >/dev/null 2>&1; then
+    msg="$(echo "$resp" | jq -r '.message // .error // empty' 2>/dev/null || true)"
+    [[ -n "$msg" ]] && echo "  $msg" >&2 || echo "  $(printf '%s' "$resp" | head -c 200)" >&2
+  else
+    printf '  %s\n' "$(printf '%s' "$resp" | head -c 200)" >&2
+  fi
+  exit 1
+fi
+
+case "$MODE" in
+  json)
+    printf '%s\n' "$resp"
+    ;;
+  count)
+    echo "$resp" | jq -r '.meta.totalItems // (.data | length)'
+    ;;
+  pretty)
+    total="$(echo "$resp" | jq -r '.meta.totalItems // (.data | length)')"
+    if [[ "$total" == "0" || -z "$total" ]]; then
+      echo "no spans found for tag ${TAG}"
+      echo "  - ensure your originator emits 'baggage: ...,ticket=${TICKET}' on outbound calls"
+      echo "  - see panacea-ai-gateway/docs/ticket-propagation-contract.md"
+      exit 0
+    fi
+    printf '%-25s %-22s %-8s %s\n' "TIMESTAMP (UTC)" "NAME" "LATENCY" "TAGS"
+    echo "$resp" | jq -r '
+      .data[] |
+      [
+        (.startTime // .timestamp // ""),
+        (.name // "(unnamed)"),
+        ((.endTime // .timestamp) as $e | (.startTime // "") as $s |
+          if $s != "" and $e != "" then
+            (((($e | sub("Z$"; "+0000") | strptime("%Y-%m-%dT%H:%M:%S.%f%z") | mktime) -
+               ($s | sub("Z$"; "+0000") | strptime("%Y-%m-%dT%H:%M:%S.%f%z") | mktime)) | tostring) + "s"
+          else "-" end),
+        (.tags | join(","))
+      ] | @tsv
+    ' 2>/dev/null | awk -F'\t' '{ printf "%-25s %-22s %-8s %s\n", $1, $2, $3, $4 }'
+    echo
+    echo "total: ${total} (use --json for full payload, env LANGFUSE_LIMIT to fetch more)"
+    ;;
+esac
