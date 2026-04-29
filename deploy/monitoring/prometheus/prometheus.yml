@@ -69,8 +69,6 @@ scrape_configs:
         labels: {mcp: knowledge-graph}
       - targets: [http://host.docker.internal:3007/health]
         labels: {mcp: nurag}
-      - targets: [http://host.docker.internal:3009/health]
-        labels: {mcp: slack}
       - targets: [http://host.docker.internal:3010/health]
         labels: {mcp: panacea-mcp}
       - targets: [http://host.docker.internal:3011/health]
@@ -95,6 +93,27 @@ scrape_configs:
     static_configs:
       - targets: [http://host.docker.internal:3008/healthz]
         labels: {mcp: atlassian}
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: __param_target
+      - source_labels: [__param_target]
+        target_label: instance
+      - target_label: __address__
+        replacement: blackbox:9115
+      - source_labels: [__param_target]
+        regex: 'http://[^:]+:(\d+)/.*'
+        target_label: mcp_port
+        replacement: '$1'
+
+  # Group D: /mcp initialize endpoint (streamable-HTTP MCPs without /health,
+  # e.g. korotovsky/slack-mcp-server). See blackbox `mcp_initialize` module.
+  - job_name: blackbox-mcp-initialize
+    metrics_path: /probe
+    params:
+      module: [mcp_initialize]
+    static_configs:
+      - targets: [http://host.docker.internal:3009/mcp]
+        labels: {mcp: slack}
     relabel_configs:
       - source_labels: [__address__]
         target_label: __param_target

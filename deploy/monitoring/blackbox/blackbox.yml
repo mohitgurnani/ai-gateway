@@ -3,7 +3,11 @@
 # - http_2xx_healthz: /healthz -> 200 (used by atlassian).
 # - mcp_tools_list: POST /mcp with JSON-RPC tools/list, expect 200 and a
 #   "tools" key in the response body. Useful for streamable-HTTP MCPs that
-#   don't expose /health.
+#   don't expose /health *and* allow tools/list without a session.
+# - mcp_initialize: POST /mcp with JSON-RPC initialize, expect 200 and a
+#   "serverInfo" key. Use for streamable-HTTP MCPs that don't expose /health
+#   AND require an established session before any other method is allowed
+#   (e.g. korotovsky/slack-mcp-server).
 
 modules:
   http_2xx_health:
@@ -40,5 +44,26 @@ modules:
       body: '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
       fail_if_body_not_matches_regexp:
         - '"tools"\s*:\s*\['
+      preferred_ip_protocol: ip4
+      ip_protocol_fallback: false
+
+  mcp_initialize:
+    # POST /mcp with a JSON-RPC `initialize` request. Works for streamable-HTTP
+    # MCP servers that don't expose /health and require a session for any other
+    # method (e.g. korotovsky/slack-mcp-server). HTTP 200 + a serverInfo block
+    # proves the server is up, authenticated to its upstream API, and serving
+    # streamable-HTTP correctly.
+    prober: http
+    timeout: 8s
+    http:
+      method: POST
+      valid_http_versions: ["HTTP/1.1", "HTTP/2.0"]
+      valid_status_codes: [200]
+      headers:
+        Content-Type: application/json
+        Accept: application/json, text/event-stream
+      body: '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"blackbox-probe","version":"1"}}}'
+      fail_if_body_not_matches_regexp:
+        - '"serverInfo"\s*:'
       preferred_ip_protocol: ip4
       ip_protocol_fallback: false

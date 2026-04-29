@@ -74,7 +74,7 @@ groups:
       # `{{ $labels.mcp_port }}` for triage, and the bare host:port is on
       # `{{ $labels.instance }}` if anyone needs it.
       - alert: MCPBackendDown
-        expr: probe_success{job=~"blackbox-mcp-(health|healthz)"} == 0
+        expr: probe_success{job=~"blackbox-mcp-.+"} == 0
         for: 5m
         labels:
           severity: critical
@@ -85,7 +85,7 @@ groups:
           description: "Health probe for `{{ $labels.mcp }}` (port {{ $labels.mcp_port }}, target `{{ $labels.instance }}`) has been failing for >=5m. Connections from the gateway to this backend will time out or 503."
 
       - alert: MCPBackendSlowProbe
-        expr: probe_duration_seconds{job=~"blackbox-mcp-(health|healthz)"} > 5
+        expr: probe_duration_seconds{job=~"blackbox-mcp-.+"} > 5
         for: 10m
         labels:
           severity: warning

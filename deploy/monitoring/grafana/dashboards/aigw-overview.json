@@ -164,7 +164,7 @@
       "pluginVersion": "11.4.0",
       "targets": [
         {
-          "expr": "probe_success{job=~\"blackbox-mcp-(health|healthz)\", mcp!=\"\"}",
+          "expr": "probe_success{job=~\"blackbox-mcp-.+\", mcp!=\"\"}",
           "legendFormat": "{{mcp}}",
           "refId": "A"
         }
@@ -253,7 +253,7 @@
       "pluginVersion": "11.4.0",
       "targets": [
         {
-          "expr": "avg_over_time(probe_success{job=~\"blackbox-mcp-(health|healthz)\", mcp!=\"\"}[5m])",
+          "expr": "avg_over_time(probe_success{job=~\"blackbox-mcp-.+\", mcp!=\"\"}[5m])",
           "legendFormat": "{{mcp}}",
           "refId": "A"
         }
@@ -340,7 +340,7 @@
       "pluginVersion": "11.4.0",
       "targets": [
         {
-          "expr": "probe_duration_seconds{job=~\"blackbox-mcp-(health|healthz)\", mcp!=\"\"}",
+          "expr": "probe_duration_seconds{job=~\"blackbox-mcp-.+\", mcp!=\"\"}",
           "legendFormat": "{{mcp}}",
           "refId": "A"
         }
