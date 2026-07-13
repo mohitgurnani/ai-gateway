@@ -212,6 +212,23 @@ func Test_parseAndValidateFlags(t *testing.T) {
 	})
 }
 
+func TestParseAndValidateFlagsMCPWriteTimeoutFromEnv(t *testing.T) {
+	t.Setenv("MCP_PROXY_WRITE_TIMEOUT", "20m")
+
+	flags, err := parseAndValidateFlags([]string{"-configPath", "/path/to/config.yaml"})
+
+	require.NoError(t, err)
+	require.Equal(t, 20*time.Minute, flags.mcpWriteTimeout)
+}
+
+func TestParseAndValidateFlagsRejectsInvalidMCPWriteTimeoutEnv(t *testing.T) {
+	t.Setenv("MCP_PROXY_WRITE_TIMEOUT", "invalid")
+
+	_, err := parseAndValidateFlags([]string{"-configPath", "/path/to/config.yaml"})
+
+	require.ErrorContains(t, err, "invalid MCP_PROXY_WRITE_TIMEOUT")
+}
+
 func TestListenAddress(t *testing.T) {
 	unixPath := t.TempDir() + "/extproc.sock"
 	// Create a stale file to ensure that removing the file works correctly.
