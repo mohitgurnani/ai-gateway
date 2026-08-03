@@ -1,0 +1,87 @@
+# Phase 4 Alertmanager config (post-relay).
+#
+# Single Slack receiver via Slack Incoming Webhook. The webhook lives in a
+# bind-mounted secret file (NOT in this YAML, NOT in git):
+#   /etc/alertmanager/secrets/slack_webhook_url
+# referenced by `global.slack_api_url_file`. Channel is fixed by the webhook
+# itself (`#panacea-mcp-monitoring`).
+#
+# Routing:
+#   * severity = critical | warning  -> 'slack'  (paged into the channel)
+#   * everything else                -> 'null'   (UI-only, no page)
+#
+# Message format intentionally mirrors the retired mcp-health-monitor's
+# Slack template (`panacea-agent/services/mcp-health-monitor/app/notifications/slack.py`):
+#   :large_orange_diamond: / :rotating_light: / :white_check_mark:
+#   ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#   *Server* / *Level* / *Error* / *Since*
+#   ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+#   *Details* / *Runbook*
+# This way operators familiar with the old monitor see no UX regression.
+#
+# Inhibit: an OtelCollectorDown page suppresses the downstream
+# OtelCollectorExportFailures / OtelCollectorQueueBackpressure alerts so we
+# don't triple-page on the same root cause.
+global:
+  resolve_timeout: 5m
+  slack_api_url_file: /etc/alertmanager/secrets/slack_webhook_url
+
+route:
+  receiver: 'null'
+  group_by: ['alertname','service','severity']
+  group_wait: 30s
+  # group_interval gates how soon a follow-up notification (incl. the
+  # send_resolved 'RECOVERED' message) goes out for the same group. We
+  # initially had it at 5m, which made resolved messages feel "lost" -
+  # operators close Slack before the 5-min window elapses. 1m matches
+  # the legacy mcp-health-monitor's perceived UX.
+  group_interval: 1m
+  repeat_interval: 6h
+  routes:
+    - matchers:
+        - severity =~ "critical|warning"
+      receiver: 'slack'
+      continue: false
+
+receivers:
+  - name: 'null'
+    # Catches anything without a recognized severity. Surfaces in the AM UI
+    # but never paged. Useful for synthetic / probe alerts.
+
+  - name: 'slack'
+    slack_configs:
+      # api_url is taken from global.slack_api_url_file; channel is fixed by
+      # the webhook ('#panacea-mcp-monitoring'). We still set `channel` for
+      # clarity in the AM UI / debug output.
+      - channel: '#panacea-mcp-monitoring'
+        send_resolved: true
+        # Sidebar color: orange (warning) / dark red (critical) / green (resolved).
+        color: '{{ if eq .Status "resolved" }}good{{ else if eq .CommonLabels.severity "critical" }}#8B0000{{ else if eq .CommonLabels.severity "warning" }}#FFA500{{ else }}danger{{ end }}'
+        # Title is the bold one-liner Slack shows above the attachment.
+        title: '{{ if eq .Status "firing" }}{{ .CommonLabels.severity | toUpper }}: {{ .CommonLabels.service }} — {{ .CommonLabels.alertname }}{{ else }}RECOVERED: {{ .CommonLabels.service }} — {{ .CommonLabels.alertname }}{{ end }}'
+        # Body iterates each alert in the group so multi-instance fires
+        # render as separate blocks. Format matches mcp-health-monitor 1:1.
+        text: |-
+          {{ range .Alerts -}}
+          {{ if eq .Status "firing" -}}
+          {{ if eq .Labels.severity "critical" }}:rotating_light:{{ else if eq .Labels.severity "warning" }}:large_orange_diamond:{{ else }}:warning:{{ end }} *{{ .Labels.severity | toUpper }} — MCP Server Issue*
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          *Server:* `{{ .Labels.service }}`{{ if .Labels.instance }} (`{{ .Labels.instance }}`){{ end }}
+          *Level:* {{ .Labels.alertname }}
+          *Error:* {{ .Annotations.summary }}
+          *Since:* {{ .StartsAt.Format "2006-01-02 15:04:05 UTC" }}
+          ━━━━━━━━━━━━━━━━━━━━━━━━━━━
+          {{ if .Annotations.description }}*Details:* {{ .Annotations.description }}
+          {{ end }}{{ if .Labels.runbook }}*Runbook:* {{ .Labels.runbook }}{{ end }}
+          {{- else -}}
+          :white_check_mark: *RECOVERED* — `{{ .Labels.service }}`{{ if .Labels.instance }} (`{{ .Labels.instance }}`){{ end }}
+          {{ .Labels.alertname }} cleared at {{ .EndsAt.Format "2006-01-02 15:04:05 UTC" }}
+          {{- end }}
+          {{ end }}
+
+inhibit_rules:
+  - source_matchers:
+      - alertname = OtelCollectorDown
+    target_matchers:
+      - alertname =~ "OtelCollector(ExportFailures|QueueBackpressure)"
+    equal: ['service']

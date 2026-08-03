@@ -1,0 +1,498 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": { "type": "grafana", "uid": "-- Grafana --" },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "Per-MCP and per-Gateway resource usage: CPU, memory, file descriptors, network throughput, restarts, and tool-call rate / latency / errors. Models the diamond mcp_usage_dashboard.html layout against locally-scraped cAdvisor / node-exporter / process-exporter / gateway-mcp metrics.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [
+    { "icon": "external link", "tags": [], "title": "AI Gateway Overview", "type": "link", "url": "/d/aigw-overview/ai-gateway-overview" },
+    { "icon": "external link", "tags": [], "title": "Langfuse traces", "type": "link", "url": "http://10.48.65.201:4000" }
+  ],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "id": 100,
+      "title": "Host overview",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "id": 101,
+      "title": "Host CPU (1m)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "options": { "graphMode": "area", "colorMode": "value", "justifyMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 70 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "100 - (avg(rate(node_cpu_seconds_total{mode=\"idle\"}[1m])) * 100)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 102,
+      "title": "Host RAM used",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "options": { "graphMode": "area", "colorMode": "value", "justifyMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 75 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 103,
+      "title": "Load (1m)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "options": { "graphMode": "area", "colorMode": "value", "justifyMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "node_load1",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 104,
+      "title": "Total host FDs",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "options": { "graphMode": "area", "colorMode": "value", "justifyMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum(namedprocess_namegroup_open_filedesc)",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 105,
+      "title": "Containers up",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "options": { "graphMode": "area", "colorMode": "value", "justifyMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "count(count by (name) (container_last_seen{name=~\".+\"}))",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "id": 106,
+      "title": "Disk used (rootfs)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "options": { "graphMode": "area", "colorMode": "value", "justifyMode": "auto", "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 80 },
+              { "color": "red", "value": 90 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "(1 - (node_filesystem_avail_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay|nfs|nfs4\"} / node_filesystem_size_bytes{mountpoint=\"/\",fstype!~\"tmpfs|overlay|nfs|nfs4\"})) * 100",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 200,
+      "title": "Per-container CPU & memory (sortable)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "table",
+      "id": 201,
+      "title": "Top containers by CPU & memory (sortable)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 12, "w": 24, "x": 0, "y": 6 },
+      "options": { "showHeader": true },
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "align": "auto", "displayMode": "auto", "filterable": true }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Value #cpu" }, "properties": [{ "id": "displayName", "value": "CPU %" }, { "id": "unit", "value": "percent" }, { "id": "custom.displayMode", "value": "lcd-gauge" }, { "id": "max", "value": 200 }, { "id": "min", "value": 0 }] },
+          { "matcher": { "id": "byName", "options": "Value #mem" }, "properties": [{ "id": "displayName", "value": "Memory" }, { "id": "unit", "value": "bytes" }, { "id": "custom.displayMode", "value": "lcd-gauge" }] },
+          { "matcher": { "id": "byName", "options": "Value #restarts" }, "properties": [{ "id": "displayName", "value": "Restarts (24h)" }, { "id": "unit", "value": "short" }] },
+          { "matcher": { "id": "byName", "options": "Value #net_rx" }, "properties": [{ "id": "displayName", "value": "Net RX/s" }, { "id": "unit", "value": "Bps" }] },
+          { "matcher": { "id": "byName", "options": "Value #net_tx" }, "properties": [{ "id": "displayName", "value": "Net TX/s" }, { "id": "unit", "value": "Bps" }] },
+          { "matcher": { "id": "byName", "options": "name" }, "properties": [{ "id": "displayName", "value": "Container" }] }
+        ]
+      },
+      "transformations": [
+        { "id": "merge", "options": {} },
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "job": true, "instance": true }, "indexByName": { "name": 0, "Value #cpu": 1, "Value #mem": 2, "Value #restarts": 3, "Value #net_rx": 4, "Value #net_tx": 5 } } }
+      ],
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\".+\"}[1m])) * 100",
+          "instant": true,
+          "format": "table",
+          "refId": "cpu"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (container_memory_working_set_bytes{name=~\".+\"})",
+          "instant": true,
+          "format": "table",
+          "refId": "mem"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (changes(container_start_time_seconds{name=~\".+\"}[24h]))",
+          "instant": true,
+          "format": "table",
+          "refId": "restarts"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (rate(container_network_receive_bytes_total{name=~\".+\"}[1m]))",
+          "instant": true,
+          "format": "table",
+          "refId": "net_rx"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name=~\".+\"}[1m]))",
+          "instant": true,
+          "format": "table",
+          "refId": "net_tx"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 300,
+      "title": "MCP container resource usage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 18 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 301,
+      "title": "MCP CPU usage (rate, per container)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 19 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (rate(container_cpu_usage_seconds_total{name=~\"$mcp_container\"}[1m])) * 100",
+          "legendFormat": "{{name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 302,
+      "title": "MCP working-set memory (per container)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 19 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (container_memory_working_set_bytes{name=~\"$mcp_container\"})",
+          "legendFormat": "{{name}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 303,
+      "title": "MCP open file descriptors (per process group)",
+      "description": "Sourced from process-exporter on the host. Group names follow `mcp:<server>` / `gateway:port-<port>` / `content-filter:<variant>`. cAdvisor v0.51 dropped container_file_descriptors, so we group by /proc/<pid>/fd counts instead.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 27 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (groupname) (namedprocess_namegroup_open_filedesc{groupname=~\"mcp:.+|gateway:.+|content-filter:.+\"})",
+          "legendFormat": "{{groupname}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 304,
+      "title": "MCP network throughput (RX + TX, per container)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 27 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (rate(container_network_receive_bytes_total{name=~\"$mcp_container\"}[1m]))",
+          "legendFormat": "{{name}} RX",
+          "refId": "A"
+        },
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (name) (rate(container_network_transmit_bytes_total{name=~\"$mcp_container\"}[1m]))",
+          "legendFormat": "{{name}} TX",
+          "refId": "B"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 400,
+      "title": "Tool-call traffic by MCP backend (gateway view)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 401,
+      "title": "Tool-call rate per MCP backend (req/s)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 36 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (mcp_backend) (rate(mcp_method_count_total{mcp_backend!=\"\"}[5m]))",
+          "legendFormat": "{{mcp_backend}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 402,
+      "title": "Tool-call p95 latency per MCP backend",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 36 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "histogram_quantile(0.95, sum by (mcp_backend, le) (rate(mcp_request_duration_bucket{mcp_backend!=\"\"}[5m])))",
+          "legendFormat": "{{mcp_backend}} p95",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 403,
+      "title": "Tool-call error rate per MCP backend",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 44 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "reqps", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (mcp_backend) (rate(mcp_method_count_total{mcp_backend!=\"\",status!=\"success\"}[5m]))",
+          "legendFormat": "{{mcp_backend}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "id": 404,
+      "title": "Top tool methods (last 1h)",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 44 },
+      "options": { "showHeader": true },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "auto", "displayMode": "auto", "filterable": true } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "Value" }, "properties": [{ "id": "displayName", "value": "Calls (1h)" }, { "id": "unit", "value": "short" }, { "id": "custom.displayMode", "value": "lcd-gauge" }] }
+        ]
+      },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "topk(20, sum by (mcp_backend, mcp_method_name) (increase(mcp_method_count_total{mcp_backend!=\"\"}[1h])))",
+          "instant": true,
+          "format": "table",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "id": 500,
+      "title": "Process-level FDs (per process group)",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 52 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "id": 501,
+      "title": "Open FDs by process group (excluding 'other:')",
+      "description": "Per-MCP / per-gateway / per-content-filter / per-host FD count from process-exporter. The 'other:*' bucket is filtered out so the panel doesn't drown the interesting series. To see all groups including OS daemons, edit the query and drop the regex.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 53 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "sum by (groupname) (namedprocess_namegroup_open_filedesc{groupname!~\"other:.*\"})",
+          "legendFormat": "{{groupname}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 502,
+      "title": "Per-MCP open FDs (process-exporter) - top movers",
+      "description": "Per-MCP FD count (groupname starts with 'mcp:'). Drives capacity planning for MCPs that maintain long-lived sockets to upstream services (Confluence, Jira, GitHub, etc.). If an MCP creeps above ~1k FDs it's a leak signal.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 61 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "topk(15, sum by (groupname) (namedprocess_namegroup_open_filedesc{groupname=~\"mcp:.+\"}))",
+          "legendFormat": "{{groupname}}",
+          "refId": "A"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "id": 503,
+      "title": "Per-MCP CPU% (process-exporter)",
+      "description": "Per-MCP CPU usage normalised to per-core percentage. This is the host-level view (process-exporter) that complements the cAdvisor 'MCP CPU usage' panel above; the two should agree closely except for short-lived sub-processes inside the container.",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 61 },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["mean", "max"] }, "tooltip": { "mode": "multi" } },
+      "fieldConfig": { "defaults": { "unit": "percent", "custom": { "drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 10 } }, "overrides": [] },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "prometheus" },
+          "expr": "100 * sum by (groupname) (rate(namedprocess_namegroup_cpu_seconds_total{groupname=~\"mcp:.+|gateway:.+\"}[2m]))",
+          "legendFormat": "{{groupname}}",
+          "refId": "A"
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["aigw", "mcp", "resource-usage", "p5"],
+  "templating": {
+    "list": [
+      {
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "definition": "label_values(container_last_seen{name=~\"panacea-.*|aigw-.*\"}, name)",
+        "hide": 0,
+        "includeAll": true,
+        "label": "MCP container",
+        "multi": true,
+        "name": "mcp_container",
+        "options": [],
+        "query": { "query": "label_values(container_last_seen{name=~\"panacea-.*|aigw-.*\"}, name)", "refId": "Prometheus-mcp_container-Variable-Query" },
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": { "from": "now-3h", "to": "now" },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "MCP & Gateway Resource Usage",
+  "uid": "aigw-mcp-usage",
+  "version": 1,
+  "weekStart": ""
+}

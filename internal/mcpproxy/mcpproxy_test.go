@@ -34,10 +34,27 @@ type fakeSpan struct {
 	backends []string
 	errType  string
 	err      error
+	// outputs captures every payload promoted to the span via
+	// RecordResponseOutput. We append (rather than store last-write-wins)
+	// so tests that exercise idempotency can assert on the call count
+	// in addition to the final value.
+	outputs [][]byte
 }
 
 func (f *fakeSpan) RecordRouteToBackend(backend string, _ string, _ bool) {
 	f.backends = append(f.backends, backend)
+}
+
+func (f *fakeSpan) RecordResponseOutput(result []byte) {
+	// Copy to insulate the test from later in-place mutation of the
+	// shared backing slice owned by the proxy/json decoder.
+	if len(result) == 0 {
+		f.outputs = append(f.outputs, nil)
+		return
+	}
+	cp := make([]byte, len(result))
+	copy(cp, result)
+	f.outputs = append(f.outputs, cp)
 }
 
 func (f *fakeSpan) EndSpan() {}
@@ -423,7 +440,7 @@ func TestInvokeJSONRPCRequest_Success(t *testing.T) {
 	m.backendListenerAddr = backendServer.URL
 	resp, err := m.invokeJSONRPCRequest(t.Context(), "route1", filterapi.MCPBackend{Name: "test-backend"}, &compositeSessionEntry{
 		sessionID: "test-session",
-	}, &jsonrpc.Request{})
+	}, &jsonrpc.Request{}, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, resp)
@@ -445,7 +462,7 @@ func TestInvokeJSONRPCRequest_NoSessionID(t *testing.T) {
 	m.backendListenerAddr = backendServer.URL
 	resp, err := m.invokeJSONRPCRequest(t.Context(), "route1", filterapi.MCPBackend{Name: "test-backend"}, &compositeSessionEntry{
 		sessionID: "",
-	}, &jsonrpc.Request{})
+	}, &jsonrpc.Request{}, nil)
 
 	require.NoError(t, err)
 	require.NotNil(t, resp)

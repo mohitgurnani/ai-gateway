@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""verify-baggage-shim — hermetic, no-network test of the local sidecar.
+
+Spawns:
+  1. A `capture` HTTP server on a random localhost port that records every inbound request.
+  2. The `panacea-baggage-shim` pointed at that capture server (PANACEA_AIGW_URL=…).
+
+Then it:
+  - writes a temporary ticket to ~/.cursor/active-ticket (backing up any existing one),
+  - issues a request through the shim with realistic Cursor-IDE-shaped headers,
+  - asserts the capture server saw `baggage: …,ticket=<TICKET>` in the forwarded request,
+  - asserts the inbound `user=` and `role=` baggage was preserved.
+
+This proves the contract on this machine without requiring Langfuse credentials. Pair with the
+manual recipe in `docs/ticket-propagation-contract.md` §4 to confirm Langfuse-side promotion.
+
+Exit code 0 on success, 1 on any assertion failure.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import http.server
+import json
+import os
+import pathlib
+import socket
+import socketserver
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+
+REPO_ROOT = pathlib.Path(__file__).resolve().parent
+SHIM = REPO_ROOT / "panacea-baggage-shim"
+TICKET = "VERIFY-1"
+ACTIVE_TICKET_FILE = pathlib.Path.home() / ".cursor" / "active-ticket"
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class CaptureHandler(http.server.BaseHTTPRequestHandler):
+    captured: list[dict] = []
+
+    def _capture(self) -> None:
+        length = int(self.headers.get("content-length") or 0)
+        body = self.rfile.read(length) if length else b""
+        CaptureHandler.captured.append(
+            {
+                "method": self.command,
+                "path": self.path,
+                "headers": {k.lower(): v for k, v in self.headers.items()},
+                "body": body.decode("utf-8", errors="replace"),
+            }
+        )
+        self.send_response(200)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+        self.wfile.write(b'{"ok": true}')
+
+    def do_GET(self):  # noqa: N802 (stdlib API)
+        self._capture()
+
+    def do_POST(self):  # noqa: N802
+        self._capture()
+
+    def log_message(self, *_args, **_kwargs):  # silence
+        return
+
+
+@contextlib.contextmanager
+def capture_server():
+    port = _free_port()
+    server = socketserver.TCPServer(("127.0.0.1", port), CaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield port
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+@contextlib.contextmanager
+def shim(upstream_port: int):
+    shim_port = _free_port()
+    env = os.environ.copy()
+    env.update(
+        {
+            "PANACEA_SHIM_BIND": "127.0.0.1",
+            "PANACEA_SHIM_PORT": str(shim_port),
+            "PANACEA_AIGW_URL": f"http://127.0.0.1:{upstream_port}",
+            "PANACEA_AIGW_ROUTES": "",
+            "PANACEA_SHIM_DEBUG": "0",
+        }
+    )
+    proc = subprocess.Popen(
+        [sys.executable, str(SHIM)],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        with contextlib.suppress(OSError):
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.settimeout(0.2)
+                s.connect(("127.0.0.1", shim_port))
+                break
+        time.sleep(0.05)
+    else:
+        stderr = proc.stderr.read().decode(errors="replace") if proc.stderr else ""
+        proc.kill()
+        raise RuntimeError(f"shim did not bind on 127.0.0.1:{shim_port}\nstderr:\n{stderr}")
+    try:
+        yield shim_port
+    finally:
+        proc.terminate()
+        with contextlib.suppress(Exception):
+            proc.wait(timeout=2)
+
+
+def _swap_active_ticket(value: str | None):
+    """Swap ~/.cursor/active-ticket atomically, returning the previous content (or None)."""
+    ACTIVE_TICKET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    prev = None
+    if ACTIVE_TICKET_FILE.exists():
+        prev = ACTIVE_TICKET_FILE.read_text()
+    if value is None:
+        ACTIVE_TICKET_FILE.unlink(missing_ok=True)
+    else:
+        ACTIVE_TICKET_FILE.write_text(value)
+    return prev
+
+
+def main() -> int:
+    print(f"verifying {SHIM} against an in-process capture upstream …")
+    if not SHIM.exists():
+        print(f"  ✗ shim not found at {SHIM}", file=sys.stderr)
+        return 1
+
+    prev_ticket = _swap_active_ticket(TICKET)
+    try:
+        CaptureHandler.captured.clear()
+        with capture_server() as up_port, shim(up_port) as shim_port:
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{shim_port}/mcp/diamond",
+                method="POST",
+                data=json.dumps({"jsonrpc": "2.0", "method": "tools/list", "id": 1}).encode(),
+                headers={
+                    "content-type": "application/json",
+                    # Mimic Cursor IDE's static baggage from ~/.cursor/mcp.json:
+                    "baggage": "user=mohit%40nutanix.com,role=engineer",
+                    "user-agent": "verify-baggage-shim",
+                },
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    resp.read()
+            except urllib.error.HTTPError as e:
+                print(f"  ✗ shim returned HTTP {e.code}: {e.read()!r}", file=sys.stderr)
+                return 1
+
+        # Assertions
+        assert CaptureHandler.captured, "capture upstream saw no inbound request"
+        cap = CaptureHandler.captured[0]
+        baggage = cap["headers"].get("baggage", "")
+        print(f"  upstream saw baggage: {baggage}")
+
+        failures: list[str] = []
+        if f"ticket={TICKET}" not in baggage:
+            failures.append(f"missing 'ticket={TICKET}' in forwarded baggage")
+        if "user=mohit%40nutanix.com" not in baggage:
+            failures.append("static 'user=' baggage was not preserved")
+        if "role=engineer" not in baggage:
+            failures.append("static 'role=' baggage was not preserved")
+        if cap["path"] != "/mcp/diamond":
+            failures.append(f"path mismatch: expected /mcp/diamond, got {cap['path']}")
+
+        if failures:
+            for f in failures:
+                print(f"  ✗ {f}", file=sys.stderr)
+            return 1
+
+        print(f"  ✓ shim correctly injected ticket={TICKET}, preserved user= and role=")
+        print(f"  ✓ path forwarded unchanged: {cap['path']}")
+        print()
+        print("hermetic test passed. Next: run a real triage in Cursor IDE with an active")
+        print("ticket and confirm the Langfuse-side spans carry `tags=ticket:<ID>` —")
+        print("see docs/ticket-propagation-contract.md §4 for the manual recipe.")
+        return 0
+    finally:
+        _swap_active_ticket(prev_ticket)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

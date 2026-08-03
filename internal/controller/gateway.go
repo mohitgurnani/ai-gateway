@@ -19,6 +19,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes"
@@ -114,6 +115,38 @@ func (c *GatewayController) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return mcpRoutes.Items[i].CreationTimestamp.Before(&mcpRoutes.Items[j].CreationTimestamp)
 	})
 
+	// List standalone MCPContentFilter objects once per reconcile across all
+	// namespaces we care about. MCPContentFilter is a "direct policy" style
+	// CRD (see BackendSecurityPolicy) that targets MCPRoutes in its own
+	// namespace via spec.targetRefs, so per-namespace scanning is sufficient.
+	// We deduplicate below when the same namespace appears on multiple routes.
+	seenNS := map[string]struct{}{}
+	var mcpContentFilters []aigv1a1.MCPContentFilter
+	for i := range mcpRoutes.Items {
+		ns := mcpRoutes.Items[i].Namespace
+		if _, ok := seenNS[ns]; ok {
+			continue
+		}
+		seenNS[ns] = struct{}{}
+		var cfs aigv1a1.MCPContentFilterList
+		if err = c.client.List(ctx, &cfs, client.InNamespace(ns)); err != nil {
+			if meta.IsNoMatchError(err) {
+				// CRD not installed in the cluster yet — this is fine; the
+				// inline form still works and no standalone objects can
+				// exist without the CRD.
+				break
+			}
+			return ctrl.Result{}, fmt.Errorf("failed to list MCPContentFilters in %s: %w", ns, err)
+		}
+		mcpContentFilters = append(mcpContentFilters, cfs.Items...)
+	}
+	sort.Slice(mcpContentFilters, func(i, j int) bool {
+		if mcpContentFilters[i].Namespace != mcpContentFilters[j].Namespace {
+			return mcpContentFilters[i].Namespace < mcpContentFilters[j].Namespace
+		}
+		return mcpContentFilters[i].Name < mcpContentFilters[j].Name
+	})
+
 	namespace, pods, deployments, daemonSets, err := c.getObjectsForGateway(ctx, gw)
 	if err != nil {
 		return ctrl.Result{}, fmt.Errorf("failed to get objects for gateway %s: %w", gw.Name, err)
@@ -132,10 +165,20 @@ func (c *GatewayController) Reconcile(ctx context.Context, req ctrl.Request) (ct
 
 	uid := c.uuidFn()
 
+	// Fetch GatewayConfig to get global LLM request cost defaults.
+	gwConfig, err := c.fetchGatewayConfig(ctx, gw)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	var defaultLLMCosts []aigv1b1.LLMRequestCost
+	if gwConfig != nil {
+		defaultLLMCosts = gwConfig.Spec.GlobalLLMRequestCosts
+	}
+
 	// We need to create the filter config in Envoy Gateway system namespace because the sidecar extproc need
 	// to access it.
 	var hasEffectiveRoutes bool // indicates whether the filter config is effective (i.e., there is at least one active route).
-	hasEffectiveRoutes, err = c.reconcileFilterConfigSecret(ctx, FilterConfigSecretPerGatewayName(gw.Name, gw.Namespace), namespace, aiRoutes.Items, mcpRoutes.Items, uid)
+	hasEffectiveRoutes, err = c.reconcileFilterConfigSecret(ctx, FilterConfigSecretPerGatewayName(gw.Name, gw.Namespace), namespace, aiRoutes.Items, mcpRoutes.Items, mcpContentFilters, uid, defaultLLMCosts)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -191,6 +234,51 @@ func bodyMutationToFilterAPI(m *aigv1b1.HTTPBodyMutation) *filterapi.HTTPBodyMut
 		ret.Set = append(ret.Set, filterapi.HTTPBodyField{Path: field.Path, Value: field.Value})
 	}
 	return ret
+}
+
+// validateCELExpression validates and returns a CEL expression for cost calculation.
+func validateCELExpression(cost aigv1b1.LLMRequestCost) (string, error) {
+	if cost.CEL == nil {
+		return "", fmt.Errorf("missing CEL expression")
+	}
+	expr := *cost.CEL
+	if _, err := llmcostcel.NewProgram(expr); err != nil {
+		return "", fmt.Errorf("invalid CEL expression: %w", err)
+	}
+	return expr, nil
+}
+
+// aigwLLMRequestCostToFilterAPI converts an API LLMRequestCost to filter API form for the given
+// AIGatewayRoute (routeName is "namespace/name").
+func aigwGlobalLLMRequestCostToFilterAPI(cost aigv1b1.LLMRequestCost) (filterapi.GlobalLLMRequestCost, error) {
+	out := filterapi.GlobalLLMRequestCost{
+		MetadataKey: cost.MetadataKey,
+		Type:        filterapi.LLMRequestCostType(cost.Type),
+	}
+	if cost.Type == aigv1b1.LLMRequestCostTypeCEL {
+		celExpr, err := validateCELExpression(cost)
+		if err != nil {
+			return filterapi.GlobalLLMRequestCost{}, err
+		}
+		out.CEL = celExpr
+	}
+	return out, nil
+}
+
+func aigwLLMRequestCostToFilterAPI(cost aigv1b1.LLMRequestCost, routeName string) (filterapi.LLMRequestCost, error) {
+	out := filterapi.LLMRequestCost{
+		MetadataKey: cost.MetadataKey,
+		RouteName:   routeName,
+		Type:        filterapi.LLMRequestCostType(cost.Type),
+	}
+	if cost.Type == aigv1b1.LLMRequestCostTypeCEL {
+		celExpr, err := validateCELExpression(cost)
+		if err != nil {
+			return filterapi.LLMRequestCost{}, err
+		}
+		out.CEL = celExpr
+	}
+	return out, nil
 }
 
 // mergeBodyMutations merges route-level and backend-level BodyMutation with route-level taking precedence.
@@ -294,12 +382,26 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 	configSecretNamespace string,
 	aiGatewayRoutes []aigv1b1.AIGatewayRoute,
 	mcpRoutes []aigv1a1.MCPRoute,
+	mcpContentFilters []aigv1a1.MCPContentFilter,
 	uuid string,
+	defaultLLMCosts []aigv1b1.LLMRequestCost,
 ) (hasEffectiveRoute bool, _ error) {
 	// Precondition: aiGatewayRoutes is not empty as we early return if it is empty.
 	ec := &filterapi.Config{UUID: uuid, Version: version.Parse()}
 	var err error
-	llmCosts := map[string]struct{}{}
+
+	// Process global LLM request costs from GatewayConfig.
+	// These have no RouteName and serve as defaults.
+	// Note: The CRD enforces uniqueness via +listType=map and +listMapKey=metadataKey,
+	// so we don't need to deduplicate here.
+	for _, cost := range defaultLLMCosts {
+		fc, convErr := aigwGlobalLLMRequestCostToFilterAPI(cost)
+		if convErr != nil {
+			return false, fmt.Errorf("failed to convert global LLMRequestCosts: %w", convErr)
+		}
+		ec.GlobalLLMRequestCosts = append(ec.GlobalLLMRequestCosts, fc)
+	}
+
 	for i := range aiGatewayRoutes {
 		aiGatewayRoute := &aiGatewayRoutes[i]
 		if !aiGatewayRoute.GetDeletionTimestamp().IsZero() {
@@ -307,7 +409,10 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 			continue
 		}
 		hasEffectiveRoute = true
+		routeName := fmt.Sprintf("%s/%s", aiGatewayRoute.Namespace, aiGatewayRoute.Name)
 		spec := aiGatewayRoute.Spec
+		routeBackendNamesSet := map[string]struct{}{}
+		routeBackendNames := []string{}
 		for ruleIndex := range spec.Rules {
 			rule := &spec.Rules[ruleIndex]
 			for _, m := range rule.Matches {
@@ -390,48 +495,36 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 				}
 
 				ec.Backends = append(ec.Backends, b)
+				if _, exists := routeBackendNamesSet[b.Name]; !exists {
+					routeBackendNamesSet[b.Name] = struct{}{}
+					routeBackendNames = append(routeBackendNames, b.Name)
+				}
 			}
-
+		}
+		if len(routeBackendNames) > 0 {
+			// Dedup per (metadataKey, routeName): last definition wins.
+			dedup := map[string]filterapi.LLMRequestCost{}
 			for _, cost := range aiGatewayRoute.Spec.LLMRequestCosts {
-				fc := filterapi.LLMRequestCost{MetadataKey: cost.MetadataKey}
-				_, ok := llmCosts[cost.MetadataKey]
-				if ok {
-					c.logger.Info("LLMRequestCost with the same metadata key already exists, skipping",
-						"metadataKey", cost.MetadataKey, "route", aiGatewayRoute.Name)
-					continue
+				fc, convErr := aigwLLMRequestCostToFilterAPI(cost, routeName)
+				if convErr != nil {
+					return false, fmt.Errorf("failed to convert LLMRequestCosts for route %s: %w", aiGatewayRoute.Name, convErr)
 				}
-				switch cost.Type {
-				case aigv1b1.LLMRequestCostTypeInputToken:
-					fc.Type = filterapi.LLMRequestCostTypeInputToken
-				case aigv1b1.LLMRequestCostTypeCachedInputToken:
-					fc.Type = filterapi.LLMRequestCostTypeCachedInputToken
-				case aigv1b1.LLMRequestCostTypeCacheCreationInputToken:
-					fc.Type = filterapi.LLMRequestCostTypeCacheCreationInputToken
-				case aigv1b1.LLMRequestCostTypeOutputToken:
-					fc.Type = filterapi.LLMRequestCostTypeOutputToken
-				case aigv1b1.LLMRequestCostTypeTotalToken:
-					fc.Type = filterapi.LLMRequestCostTypeTotalToken
-				case aigv1b1.LLMRequestCostTypeCEL:
-					fc.Type = filterapi.LLMRequestCostTypeCEL
-					expr := *cost.CEL
-					// Sanity check the CEL expression.
-					_, err = llmcostcel.NewProgram(expr)
-					if err != nil {
-						return false, fmt.Errorf("invalid CEL expression: %w", err)
-					}
-					fc.CEL = expr
-				default:
-					return false, fmt.Errorf("unknown request cost type: %s", cost.Type)
-				}
+				key := fc.MetadataKey
+				dedup[key] = fc
+			}
+			for _, fc := range dedup {
 				ec.LLMRequestCosts = append(ec.LLMRequestCosts, fc)
-				llmCosts[cost.MetadataKey] = struct{}{}
 			}
 		}
 	}
 
 	// Configuration for MCP processor.
 	var effectiveMCPRoute bool
-	ec.MCPConfig, effectiveMCPRoute = mcpConfig(mcpRoutes)
+	var mcpErr error
+	ec.MCPConfig, effectiveMCPRoute, mcpErr = mcpConfig(mcpRoutes, mcpContentFilters)
+	if mcpErr != nil {
+		return false, fmt.Errorf("failed to build MCP config: %w", mcpErr)
+	}
 	hasEffectiveRoute = hasEffectiveRoute || effectiveMCPRoute
 
 	marshaled, err := yaml.Marshal(ec)
@@ -463,10 +556,30 @@ func (c *GatewayController) reconcileFilterConfigSecret(
 	return hasEffectiveRoute, nil
 }
 
-// reconcileFilterConfigSecretForMCPGateway updates the filter config secret for the external processor.
-func mcpConfig(mcpRoutes []aigv1a1.MCPRoute) (_ *filterapi.MCPConfig, hasEffectiveRoute bool) {
+// mcpConfig reconciles the state of MCPRoute + MCPContentFilter CRDs into
+// the runtime filterapi configuration.
+//
+// Per (MCPRoute, backend) pair we resolve the effective content filter in
+// this order:
+//
+//  1. Standalone [aigv1a1.MCPContentFilter] objects whose spec.targetRefs
+//     select this (route, backend) pair. A target ref with no sectionName
+//     applies route-wide; a ref with a sectionName applies only to the
+//     matching backend.
+//  2. Inline [aigv1a1.MCPRouteBackendRef.ContentFilter] (the legacy /
+//     convenience form).
+//
+// Standalone wins on conflict: if both an inline filter and a standalone
+// filter apply to the same backend the standalone value is used and the
+// inline one is ignored. If more than one *standalone* filter targets the
+// same (route, backend) pair we reject the whole configuration, matching
+// [aigv1a1.BackendSecurityPolicy] semantics.
+func mcpConfig(
+	mcpRoutes []aigv1a1.MCPRoute,
+	mcpContentFilters []aigv1a1.MCPContentFilter,
+) (_ *filterapi.MCPConfig, hasEffectiveRoute bool, _ error) {
 	if len(mcpRoutes) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
 	mc := &filterapi.MCPConfig{
@@ -483,6 +596,7 @@ func mcpConfig(mcpRoutes []aigv1a1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 			Backends: []filterapi.MCPBackend{},
 		}
 		for _, b := range route.Spec.BackendRefs {
+			backendName := string(b.Name)
 			mcpBackend := filterapi.MCPBackend{
 				// MCPRoute doesn't support cross-namespace backend reference so just use the name.
 				Name: filterapi.MCPBackendName(b.Name),
@@ -494,6 +608,26 @@ func mcpConfig(mcpRoutes []aigv1a1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 					Exclude:      b.ToolSelector.Exclude,
 					ExcludeRegex: b.ToolSelector.ExcludeRegex,
 				}
+			}
+			for _, fh := range b.ForwardHeaders {
+				hf := filterapi.MCPHeaderForward{Name: fh.Name}
+				if fh.BackendHeader != nil {
+					hf.BackendHeader = *fh.BackendHeader
+				}
+				mcpBackend.ForwardHeaders = append(mcpBackend.ForwardHeaders, hf)
+			}
+
+			// Resolve standalone content filter first; it takes precedence
+			// over any inline value. Conflicts (more than one standalone
+			// filter targeting this backend) surface as errors.
+			standalone, err := resolveStandaloneContentFilter(mcpContentFilters, route, backendName)
+			if err != nil {
+				return nil, false, err
+			}
+			if standalone != nil {
+				mcpBackend.ContentFilter = translateContentFilter(&standalone.Spec.MCPContentFilterConfig)
+			} else if b.ContentFilter != nil {
+				mcpBackend.ContentFilter = translateContentFilter(b.ContentFilter)
 			}
 			mcpRoute.Backends = append(
 				mcpRoute.Backends, mcpBackend)
@@ -558,7 +692,7 @@ func mcpConfig(mcpRoutes []aigv1a1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 				mcpRoute.Authorization.Rules = append(mcpRoute.Authorization.Rules, mcpRule)
 			}
 		}
-		// Add headers to forward from the incoming request to backend MCP servers.
+		// Forward OAuth claim-to-header mappings to all backends in this route.
 		if route.Spec.SecurityPolicy != nil && route.Spec.SecurityPolicy.OAuth != nil {
 			for _, ctoh := range route.Spec.SecurityPolicy.OAuth.ClaimToHeaders {
 				mcpRoute.ForwardHeaders = append(mcpRoute.ForwardHeaders, ctoh.Header)
@@ -566,7 +700,136 @@ func mcpConfig(mcpRoutes []aigv1a1.MCPRoute) (_ *filterapi.MCPConfig, hasEffecti
 		}
 		mc.Routes = append(mc.Routes, mcpRoute)
 	}
-	return mc, hasEffectiveRoute
+	return mc, hasEffectiveRoute, nil
+}
+
+// mcpContentFilterGroup is the API group used for MCPRoute targetRefs on
+// standalone [aigv1a1.MCPContentFilter] objects. Keep this separate from
+// the scheme constants so the resolver can match on the stringly-typed
+// values carried by [gwapiv1a2.LocalPolicyTargetReferenceWithSectionName].
+const (
+	mcpContentFilterGroup = aigv1a1.GroupName
+	mcpContentFilterKind  = "MCPRoute"
+)
+
+// resolveStandaloneContentFilter looks for a standalone
+// [aigv1a1.MCPContentFilter] that targets the given (route, backend) pair
+// via its spec.targetRefs.
+//
+// Target reference matching:
+//   - group must be the aigateway API group and kind must be "MCPRoute";
+//   - the referenced MCPRoute name must equal route.Name and the
+//     MCPContentFilter must live in the same namespace as the route
+//     (MCPContentFilter is a "direct policy" attachment, not a cross-
+//     namespace ref);
+//   - sectionName, if set, must equal backendName. sectionName == "" is
+//     treated as route-wide (applies to every backend on the route).
+//
+// Conflict semantics:
+//   - 0 matches → (nil, nil) and the caller falls back to the inline
+//     MCPRouteBackendRef.ContentFilter value.
+//   - 1 match → the matched object is returned and its Spec.Config
+//     supersedes any inline value.
+//   - >1 matches → an error is returned so the caller can reject the whole
+//     reconcile, mirroring BackendSecurityPolicy behaviour.
+func resolveStandaloneContentFilter(
+	filters []aigv1a1.MCPContentFilter,
+	route *aigv1a1.MCPRoute,
+	backendName string,
+) (*aigv1a1.MCPContentFilter, error) {
+	var matched []*aigv1a1.MCPContentFilter
+	for i := range filters {
+		f := &filters[i]
+		if !f.GetDeletionTimestamp().IsZero() {
+			continue
+		}
+		if f.Namespace != route.Namespace {
+			continue
+		}
+		for _, ref := range f.Spec.TargetRefs {
+			if string(ref.Group) != mcpContentFilterGroup {
+				continue
+			}
+			if string(ref.Kind) != mcpContentFilterKind {
+				continue
+			}
+			if string(ref.Name) != route.Name {
+				continue
+			}
+			if ref.SectionName != nil && string(*ref.SectionName) != backendName {
+				continue
+			}
+			matched = append(matched, f)
+			break
+		}
+	}
+	switch len(matched) {
+	case 0:
+		return nil, nil
+	case 1:
+		return matched[0], nil
+	default:
+		names := make([]string, 0, len(matched))
+		for _, f := range matched {
+			names = append(names, fmt.Sprintf("%s/%s", f.Namespace, f.Name))
+		}
+		return nil, fmt.Errorf(
+			"multiple MCPContentFilter objects target MCPRoute %s/%s backend %q: %s",
+			route.Namespace, route.Name, backendName, strings.Join(names, ", "),
+		)
+	}
+}
+
+// translateContentFilter converts the CRD representation of a per-backend
+// content filter into the runtime filterapi representation. The CRD uses
+// optional pointers for fields that have defaults; those defaults are
+// resolved by the proxy at runtime, so we forward zero values as-is here.
+//
+// The input is [aigv1a1.MCPContentFilterConfig], the value shape shared by
+// the inline form (embedded in [aigv1a1.MCPRouteBackendRef.ContentFilter])
+// and the standalone CRD ([aigv1a1.MCPContentFilter.Spec]). This lets the
+// same translation logic handle both attachment forms.
+func translateContentFilter(cf *aigv1a1.MCPContentFilterConfig) *filterapi.MCPContentFilter {
+	if cf == nil {
+		return nil
+	}
+	scopes := make([]filterapi.MCPContentFilterScope, 0, len(cf.Scopes))
+	for _, s := range cf.Scopes {
+		scopes = append(scopes, filterapi.MCPContentFilterScope(s))
+	}
+	// Policies are forwarded verbatim; the runtime mirror preserves
+	// the same ordering and set semantics so the gateway can emit
+	// them in the filter envelope without re-validating. An empty
+	// input list is mapped to a nil slice (omitempty in JSON).
+	var policies []filterapi.MCPContentFilterPolicy
+	if len(cf.Policies) > 0 {
+		policies = make([]filterapi.MCPContentFilterPolicy, 0, len(cf.Policies))
+		for _, p := range cf.Policies {
+			policies = append(policies, filterapi.MCPContentFilterPolicy(p))
+		}
+	}
+	out := &filterapi.MCPContentFilter{
+		URL:                      cf.URL,
+		Scopes:                   scopes,
+		TimeoutSeconds:           ptr.Deref(cf.TimeoutSeconds, 0),
+		ForwardHeaders:           append([]string(nil), cf.ForwardHeaders...),
+		ShadowSampleRatePermille: ptr.Deref(cf.ShadowSampleRatePermille, 0),
+		Policies:                 policies,
+	}
+	if cf.FailurePolicy != nil {
+		out.FailurePolicy = filterapi.MCPContentFilterFailurePolicy(*cf.FailurePolicy)
+	}
+	if cf.Mode != nil {
+		out.Mode = filterapi.MCPContentFilterMode(*cf.Mode)
+	}
+	// Enabled is forwarded by pointer so the runtime can distinguish
+	// "unset (default true)" from "explicitly false". The CRD and
+	// runtime share the same nullable-bool contract.
+	if cf.Enabled != nil {
+		b := *cf.Enabled
+		out.Enabled = &b
+	}
+	return out
 }
 
 func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backendSecurityPolicy *aigv1b1.BackendSecurityPolicy) (*filterapi.BackendAuth, error) {
@@ -633,6 +896,19 @@ func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backe
 			AzureAuth: &filterapi.AzureAuth{AccessToken: azureAccessToken},
 		}, nil
 	case aigv1b1.BackendSecurityPolicyTypeGCPCredentials:
+		gcpCreds := backendSecurityPolicy.Spec.GCPCredentials
+
+		// If no credentials file or WIF is configured, use ADC (handled by extproc)
+		if gcpCreds.CredentialsFile == nil && gcpCreds.WorkloadIdentityFederationConfig == nil {
+			return &filterapi.BackendAuth{
+				GCPAuth: &filterapi.GCPAuth{
+					Region:      gcpCreds.Region,
+					ProjectName: gcpCreds.ProjectName,
+				},
+			}, nil
+		}
+
+		// Otherwise, fetch token from rotated secret
 		secretName := rotators.GetBSPSecretName(backendSecurityPolicy.Name)
 		gcpAccessToken, err := c.getSecretData(ctx, namespace, secretName, rotators.GCPAccessTokenKey)
 		if err != nil {
@@ -641,8 +917,8 @@ func (c *GatewayController) bspToFilterAPIBackendAuth(ctx context.Context, backe
 		return &filterapi.BackendAuth{
 			GCPAuth: &filterapi.GCPAuth{
 				AccessToken: gcpAccessToken,
-				Region:      backendSecurityPolicy.Spec.GCPCredentials.Region,
-				ProjectName: backendSecurityPolicy.Spec.GCPCredentials.ProjectName,
+				Region:      gcpCreds.Region,
+				ProjectName: gcpCreds.ProjectName,
 			},
 		}, nil
 	default:
@@ -980,4 +1256,32 @@ func (c *GatewayController) getObjectsForGateway(ctx context.Context, gw *gwapiv
 		namespace = daemonSets[0].Namespace
 	}
 	return
+}
+
+// fetchGatewayConfig returns the referenced GatewayConfig (if present) for the given Gateway.
+// Returns nil if no GatewayConfig is referenced or if it cannot be found.
+// fetchGatewayConfig returns the referenced GatewayConfig (if present) for the given Gateway.
+// Returns (nil, nil) if: no annotation, empty annotation, or GatewayConfig not found.
+// Returns (nil, error) for transient failures (API errors) to trigger reconciliation retry.
+func (c *GatewayController) fetchGatewayConfig(ctx context.Context, gw *gwapiv1.Gateway) (*aigv1b1.GatewayConfig, error) {
+	configName, ok := gw.Annotations[GatewayConfigAnnotationKey]
+	if !ok || configName == "" {
+		return nil, nil
+	}
+
+	// Fetch the GatewayConfig (must be in same namespace as Gateway).
+	var gatewayConfig aigv1b1.GatewayConfig
+	if err := c.client.Get(ctx, client.ObjectKey{Name: configName, Namespace: gw.Namespace}, &gatewayConfig); err != nil {
+		if apierrors.IsNotFound(err) {
+			c.logger.Info("GatewayConfig referenced by Gateway not found, using defaults",
+				"gateway_name", gw.Name, "gateway_namespace", gw.Namespace, "gatewayconfig_name", configName)
+			return nil, nil
+		}
+		// Return error for transient failures (e.g., API errors) to trigger retry.
+		return nil, fmt.Errorf("failed to get GatewayConfig: %w", err)
+	}
+
+	c.logger.Info("found GatewayConfig for Gateway",
+		"gateway_name", gw.Name, "gateway_namespace", gw.Namespace, "gatewayconfig_name", configName)
+	return &gatewayConfig, nil
 }

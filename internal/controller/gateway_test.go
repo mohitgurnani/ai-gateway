@@ -32,7 +32,23 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/controller/rotators"
 	"github.com/envoyproxy/ai-gateway/internal/filterapi"
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
+	"github.com/envoyproxy/ai-gateway/internal/llmcostcel"
 )
+
+// requireLLMRequestCostsEqual asserts two LLMRequestCost slices are equal, printing a go-cmp diff on failure.
+func requireLLMRequestCostsEqual(t *testing.T, want, got []filterapi.LLMRequestCost) {
+	t.Helper()
+	// Compare as sets (order-agnostic) since map iteration order is non-deterministic.
+	less := func(a, b filterapi.LLMRequestCost) bool {
+		if a.RouteName != b.RouteName {
+			return a.RouteName < b.RouteName
+		}
+		return a.MetadataKey < b.MetadataKey
+	}
+	if diff := cmp.Diff(want, got, cmpopts.SortSlices(less)); diff != "" {
+		t.Fatalf("LLMRequestCosts not equal (-want +got):\n%s", diff)
+	}
+}
 
 func TestGatewayController_Reconcile(t *testing.T) {
 	fakeClient := requireNewFakeClientWithIndexes(t)
@@ -203,7 +219,7 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 					{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "orange"}}},
 				},
 				LLMRequestCosts: []aigv1b1.LLMRequestCost{
-					{MetadataKey: "foo", Type: aigv1b1.LLMRequestCostTypeInputToken}, // This should be ignored as it has the duplicate key.
+					{MetadataKey: "foo", Type: aigv1b1.LLMRequestCostTypeInputToken}, // Same metadataKey as route1; scoped to this route in filter config.
 					{MetadataKey: "cat", Type: aigv1b1.LLMRequestCostTypeCEL, CEL: ptr.To(`backend == 'foo.default' ?  input_tokens + output_tokens : total_tokens`)},
 				},
 			},
@@ -260,7 +276,7 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 	for range 2 { // Reconcile twice to make sure the secret update path is working.
 		const someNamespace = "some-namespace"
 		configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
-		effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+		effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, nil, "foouuid", nil)
 		require.NoError(t, err)
 		require.True(t, effective, "expected filter config to be effective")
 
@@ -271,14 +287,28 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 		var fc filterapi.Config
 		require.NoError(t, yaml.Unmarshal([]byte(configStr), &fc))
 		require.Equal(t, "dev", fc.Version)
-		require.Len(t, fc.LLMRequestCosts, 6)
-		require.Equal(t, filterapi.LLMRequestCostTypeInputToken, fc.LLMRequestCosts[0].Type)
-		require.Equal(t, filterapi.LLMRequestCostTypeOutputToken, fc.LLMRequestCosts[1].Type)
-		require.Equal(t, filterapi.LLMRequestCostTypeTotalToken, fc.LLMRequestCosts[2].Type)
-		require.Equal(t, filterapi.LLMRequestCostTypeCachedInputToken, fc.LLMRequestCosts[3].Type)
-		require.Equal(t, filterapi.LLMRequestCostTypeCacheCreationInputToken, fc.LLMRequestCosts[4].Type)
-		require.Equal(t, filterapi.LLMRequestCostTypeCEL, fc.LLMRequestCosts[5].Type)
-		require.Equal(t, `backend == 'foo.default' ?  input_tokens + output_tokens : total_tokens`, fc.LLMRequestCosts[5].CEL)
+		wantLLMRequestCosts := []filterapi.LLMRequestCost{
+			{MetadataKey: "foo", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeInputToken},
+			{MetadataKey: "bar", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeOutputToken},
+			{MetadataKey: "baz", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeTotalToken},
+			{MetadataKey: "qux", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeCachedInputToken},
+			{MetadataKey: "zoo", RouteName: "ns/route1", Type: filterapi.LLMRequestCostTypeCacheCreationInputToken},
+			{MetadataKey: "foo", RouteName: "ns/route2", Type: filterapi.LLMRequestCostTypeInputToken},
+			{
+				MetadataKey: "cat",
+				RouteName:   "ns/route2",
+				Type:        filterapi.LLMRequestCostTypeCEL,
+				CEL:         `backend == 'foo.default' ?  input_tokens + output_tokens : total_tokens`,
+			},
+		}
+		requireLLMRequestCostsEqual(t, wantLLMRequestCosts, fc.LLMRequestCosts)
+
+		catProg, err := llmcostcel.NewProgram(wantLLMRequestCosts[6].CEL)
+		require.NoError(t, err)
+		catVal, err := llmcostcel.EvaluateProgram(catProg, "model", "foo.default", "ns/route2", 3, 0, 0, 4, 7, 0)
+		require.NoError(t, err)
+		require.Equal(t, uint64(7), catVal)
+
 		require.Len(t, fc.Models, 1)
 		require.Equal(t, "mymodel", fc.Models[0].Name)
 
@@ -288,6 +318,204 @@ func TestGatewayController_reconcileFilterConfigSecret(t *testing.T) {
 		require.Equal(t, "foo", fc.Backends[0].HeaderMutation.Set[0].Value)
 		require.Equal(t, "x-bar", fc.Backends[0].HeaderMutation.Remove[0])
 	}
+}
+
+// TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostAggregation verifies that
+// routes sharing the same metadataKey each get their own filter-config row (scoped by routeName).
+func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostAggregation(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexes(t)
+	kube := fake2.NewClientset()
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
+	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
+
+	const gwNamespace = "ns"
+	// Create two routes with DIFFERENT CEL expressions for the SAME metadataKey.
+	// This is the core scenario of Issue #1688.
+	routes := []aigv1b1.AIGatewayRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "free-model-route", Namespace: gwNamespace},
+			Spec: aigv1b1.AIGatewayRouteSpec{
+				Rules: []aigv1b1.AIGatewayRouteRule{
+					{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "free-backend"}}},
+				},
+				LLMRequestCosts: []aigv1b1.LLMRequestCost{
+					// Free model: cost is always 0
+					{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeCEL, CEL: ptr.To("0")},
+				},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "paid-model-route", Namespace: gwNamespace},
+			Spec: aigv1b1.AIGatewayRouteSpec{
+				Rules: []aigv1b1.AIGatewayRouteRule{
+					{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "paid-backend"}}},
+				},
+				LLMRequestCosts: []aigv1b1.LLMRequestCost{
+					// Paid model: cost calculation based on tokens
+					{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeCEL, CEL: ptr.To("input_tokens + output_tokens")},
+				},
+			},
+		},
+	}
+
+	// Create corresponding AIServiceBackends.
+	for _, backend := range []*aigv1b1.AIServiceBackend{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "free-backend", Namespace: gwNamespace},
+			Spec: aigv1b1.AIServiceBackendSpec{
+				BackendRef: gwapiv1.BackendObjectReference{Name: "some-backend", Namespace: ptr.To[gwapiv1.Namespace](gwNamespace)},
+			},
+		},
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "paid-backend", Namespace: gwNamespace},
+			Spec: aigv1b1.AIServiceBackendSpec{
+				BackendRef: gwapiv1.BackendObjectReference{Name: "some-backend", Namespace: ptr.To[gwapiv1.Namespace](gwNamespace)},
+			},
+		},
+	} {
+		err := fakeClient.Create(t.Context(), backend)
+		require.NoError(t, err)
+	}
+
+	const someNamespace = "some-namespace"
+	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, nil, "foouuid", nil)
+	require.NoError(t, err)
+	require.True(t, effective, "expected filter config to be effective")
+
+	secret, err := kube.CoreV1().Secrets(someNamespace).Get(t.Context(), configName, metav1.GetOptions{})
+	require.NoError(t, err)
+	configStr, ok := secret.StringData[FilterConfigKeyInSecret]
+	require.True(t, ok)
+	var fc filterapi.Config
+	require.NoError(t, yaml.Unmarshal([]byte(configStr), &fc))
+
+	// Verify we have two backends and one filter-config row per route (same metadataKey).
+	require.Len(t, fc.Backends, 2, "expected 2 backends")
+	wantLLMRequestCosts := []filterapi.LLMRequestCost{
+		{
+			MetadataKey: "billing_charges",
+			RouteName:   "ns/free-model-route",
+			Type:        filterapi.LLMRequestCostTypeCEL,
+			CEL:         "0",
+		},
+		{
+			MetadataKey: "billing_charges",
+			RouteName:   "ns/paid-model-route",
+			Type:        filterapi.LLMRequestCostTypeCEL,
+			CEL:         "input_tokens + output_tokens",
+		},
+	}
+	requireLLMRequestCostsEqual(t, wantLLMRequestCosts, fc.LLMRequestCosts)
+
+	freeProg, err := llmcostcel.NewProgram(wantLLMRequestCosts[0].CEL)
+	require.NoError(t, err)
+	val, err := llmcostcel.EvaluateProgram(freeProg, "model", "free-backend", "ns/free-model-route", 10, 0, 0, 5, 15, 0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), val)
+	paidProg, err := llmcostcel.NewProgram(wantLLMRequestCosts[1].CEL)
+	require.NoError(t, err)
+	val, err = llmcostcel.EvaluateProgram(paidProg, "model", "paid-backend", "ns/paid-model-route", 10, 0, 0, 5, 15, 0)
+	require.NoError(t, err)
+	require.Equal(t, uint64(15), val)
+}
+
+// TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostAggregation_DuplicateMetadataKey
+// verifies that duplicate metadata keys keep "last definition wins" semantics.
+func TestGatewayController_reconcileFilterConfigSecret_RouteLevelLLMRequestCostAggregation_DuplicateMetadataKey(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexes(t)
+	kube := fake2.NewClientset()
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
+	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
+
+	const gwNamespace = "ns"
+	routes := []aigv1b1.AIGatewayRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-with-duplicate-metadata", Namespace: gwNamespace},
+			Spec: aigv1b1.AIGatewayRouteSpec{
+				Rules: []aigv1b1.AIGatewayRouteRule{
+					{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "test-backend"}}},
+				},
+				LLMRequestCosts: []aigv1b1.LLMRequestCost{
+					{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeInputToken},
+					{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeOutputToken},
+				},
+			},
+		},
+	}
+
+	err := fakeClient.Create(t.Context(), &aigv1b1.AIServiceBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-backend", Namespace: gwNamespace},
+		Spec: aigv1b1.AIServiceBackendSpec{
+			BackendRef: gwapiv1.BackendObjectReference{Name: "some-backend", Namespace: ptr.To[gwapiv1.Namespace](gwNamespace)},
+		},
+	})
+	require.NoError(t, err)
+
+	const someNamespace = "some-namespace"
+	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, nil, "foouuid", nil)
+	require.NoError(t, err)
+	require.True(t, effective, "expected filter config to be effective")
+
+	secret, err := kube.CoreV1().Secrets(someNamespace).Get(t.Context(), configName, metav1.GetOptions{})
+	require.NoError(t, err)
+	configStr, ok := secret.StringData[FilterConfigKeyInSecret]
+	require.True(t, ok)
+	var fc filterapi.Config
+	require.NoError(t, yaml.Unmarshal([]byte(configStr), &fc))
+	// Controller deduplicates same (metadataKey, routeName): last definition wins.
+	wantLLMRequestCosts := []filterapi.LLMRequestCost{
+		{
+			MetadataKey: "billing_charges",
+			RouteName:   "ns/route-with-duplicate-metadata",
+			Type:        filterapi.LLMRequestCostTypeOutputToken,
+		},
+	}
+	requireLLMRequestCostsEqual(t, wantLLMRequestCosts, fc.LLMRequestCosts)
+}
+
+// TestGatewayController_reconcileFilterConfigSecret_InvalidCELExpression tests that invalid CEL
+// expressions in LLMRequestCosts cause an error during reconciliation.
+func TestGatewayController_reconcileFilterConfigSecret_InvalidCELExpression(t *testing.T) {
+	fakeClient := requireNewFakeClientWithIndexes(t)
+	kube := fake2.NewClientset()
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
+	c := NewGatewayController(fakeClient, kube, ctrl.Log,
+		"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
+
+	const gwNamespace = "ns"
+	routes := []aigv1b1.AIGatewayRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route-with-invalid-cel", Namespace: gwNamespace},
+			Spec: aigv1b1.AIGatewayRouteSpec{
+				Rules: []aigv1b1.AIGatewayRouteRule{
+					{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "test-backend"}}},
+				},
+				LLMRequestCosts: []aigv1b1.LLMRequestCost{
+					// Invalid CEL expression - syntax error
+					{MetadataKey: "cost", Type: aigv1b1.LLMRequestCostTypeCEL, CEL: ptr.To("invalid syntax (((")},
+				},
+			},
+		},
+	}
+
+	// Create the backend
+	err := fakeClient.Create(t.Context(), &aigv1b1.AIServiceBackend{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-backend", Namespace: gwNamespace},
+		Spec: aigv1b1.AIServiceBackendSpec{
+			BackendRef: gwapiv1.BackendObjectReference{Name: "some-backend", Namespace: ptr.To[gwapiv1.Namespace](gwNamespace)},
+		},
+	})
+	require.NoError(t, err)
+
+	const someNamespace = "some-namespace"
+	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
+	_, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, nil, "foouuid", nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "invalid CEL expression")
 }
 
 func TestGatewayController_reconcileFilterConfigSecret_SkipsDeletedRoutes(t *testing.T) {
@@ -379,7 +607,7 @@ func TestGatewayController_reconcileFilterConfigSecret_SkipsDeletedRoutes(t *tes
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
 
 	// Reconcile filter config secret.
-	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, "foouuid")
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, routes, nil, nil, "foouuid", nil)
 	require.NoError(t, err)
 	require.True(t, effective, "expected filter config to be effective")
 
@@ -480,6 +708,16 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 			},
 		},
 		{
+			ObjectMeta: metav1.ObjectMeta{Name: "gcp-adc", Namespace: namespace},
+			Spec: aigv1b1.BackendSecurityPolicySpec{
+				Type: aigv1b1.BackendSecurityPolicyTypeGCPCredentials,
+				GCPCredentials: &aigv1b1.BackendSecurityPolicyGCPCredentials{
+					ProjectName: "test-project",
+					Region:      "us-central1",
+				},
+			},
+		},
+		{
 			ObjectMeta: metav1.ObjectMeta{Name: "bsp-anthropic-apikey", Namespace: namespace},
 			Spec: aigv1b1.BackendSecurityPolicySpec{
 				Type: aigv1b1.BackendSecurityPolicyTypeAnthropicAPIKey,
@@ -562,6 +800,15 @@ func TestGatewayController_bspToFilterAPIBackendAuth(t *testing.T) {
 			bspName: "gcp-wif",
 			exp: &filterapi.BackendAuth{
 				GCPAuth: &filterapi.GCPAuth{AccessToken: "thisisgcpcredentials"},
+			},
+		},
+		{
+			bspName: "gcp-adc",
+			exp: &filterapi.BackendAuth{
+				GCPAuth: &filterapi.GCPAuth{
+					Region:      "us-central1",
+					ProjectName: "test-project",
+				},
 			},
 		},
 		{
@@ -1737,10 +1984,10 @@ func TestGatewayController_reconcileFilterMCPConfigSecret(t *testing.T) {
 	const someNamespace = "some-namespace"
 	configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
 
-	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, nil, "mcp-uuid")
+	effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, nil, nil, "mcp-uuid", nil)
 	require.NoError(t, err)
 	require.False(t, effective) // No MCP routes, so not effective.
-	effective, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, mcpRoutes, "mcp-uuid")
+	effective, err = c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, nil, mcpRoutes, nil, "mcp-uuid", nil)
 	require.NoError(t, err)
 	require.True(t, effective)
 
@@ -1776,7 +2023,8 @@ func Test_mcpConfig_ToolSelectorExclude(t *testing.T) {
 		},
 	}
 
-	mc, effective := mcpConfig(mcpRoutes)
+	mc, effective, err := mcpConfig(mcpRoutes, nil)
+	require.NoError(t, err)
 	require.True(t, effective)
 	require.NotNil(t, mc)
 	require.Len(t, mc.Routes, 1)
@@ -1786,6 +2034,334 @@ func Test_mcpConfig_ToolSelectorExclude(t *testing.T) {
 	require.Equal(t, []string{"toolA"}, ts.Include)
 	require.Equal(t, []string{"toolB"}, ts.Exclude)
 	require.Equal(t, []string{"^secret.*"}, ts.ExcludeRegex)
+}
+
+func Test_mcpConfig_ForwardHeaders(t *testing.T) {
+	renamed := "X-Backend-Auth"
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{
+					{
+						BackendObjectReference: gwapiv1.BackendObjectReference{
+							Name: gwapiv1.ObjectName("backendA"),
+						},
+						ForwardHeaders: []aigv1a1.MCPHeaderForward{
+							{Name: "X-Api-Key"},
+							{Name: "Authorization", BackendHeader: &renamed},
+						},
+					},
+					{
+						BackendObjectReference: gwapiv1.BackendObjectReference{
+							Name: gwapiv1.ObjectName("backendB"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	mc, effective, err := mcpConfig(mcpRoutes, nil)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.NotNil(t, mc)
+	require.Len(t, mc.Routes, 1)
+	require.Len(t, mc.Routes[0].Backends, 2)
+
+	backendA := mc.Routes[0].Backends[0]
+	require.Equal(t, "backendA", backendA.Name)
+	require.Len(t, backendA.ForwardHeaders, 2)
+	require.Equal(t, filterapi.MCPHeaderForward{Name: "X-Api-Key"}, backendA.ForwardHeaders[0])
+	require.Equal(t, filterapi.MCPHeaderForward{Name: "Authorization", BackendHeader: "X-Backend-Auth"}, backendA.ForwardHeaders[1])
+
+	backendB := mc.Routes[0].Backends[1]
+	require.Equal(t, "backendB", backendB.Name)
+	require.Empty(t, backendB.ForwardHeaders)
+}
+
+func Test_mcpConfig_ContentFilter(t *testing.T) {
+	timeout := int32(30)
+	failPolicy := aigv1a1.MCPContentFilterFailurePolicyFail
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{
+					{
+						// Backend with both scopes and a custom failure
+						// policy, timeout, and forward headers.
+						BackendObjectReference: gwapiv1.BackendObjectReference{
+							Name: gwapiv1.ObjectName("supportgpt"),
+						},
+						ContentFilter: &aigv1a1.MCPContentFilterConfig{
+							URL: "http://content-filter.svc.cluster.local:8080/filter",
+							Scopes: []aigv1a1.MCPContentFilterScope{
+								aigv1a1.MCPContentFilterScopeRequest,
+								aigv1a1.MCPContentFilterScopeResponse,
+							},
+							TimeoutSeconds: &timeout,
+							FailurePolicy:  &failPolicy,
+							ForwardHeaders: []string{"x-ticket-id", "x-request-id"},
+						},
+					},
+					{
+						// Backend with no content filter at all.
+						BackendObjectReference: gwapiv1.BackendObjectReference{
+							Name: gwapiv1.ObjectName("plain"),
+						},
+					},
+				},
+			},
+		},
+	}
+
+	mc, effective, err := mcpConfig(mcpRoutes, nil)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.NotNil(t, mc)
+	require.Len(t, mc.Routes, 1)
+	require.Len(t, mc.Routes[0].Backends, 2)
+
+	// Sort-stable lookup so the test isn't sensitive to slice ordering.
+	var withCF, withoutCF *filterapi.MCPBackend
+	for i := range mc.Routes[0].Backends {
+		b := &mc.Routes[0].Backends[i]
+		if b.Name == "supportgpt" {
+			withCF = b
+		} else {
+			withoutCF = b
+		}
+	}
+	require.NotNil(t, withCF)
+	require.NotNil(t, withoutCF)
+
+	require.Nil(t, withoutCF.ContentFilter, "backends without contentFilter spec must translate to nil")
+
+	cf := withCF.ContentFilter
+	require.NotNil(t, cf)
+	require.Equal(t, "http://content-filter.svc.cluster.local:8080/filter", cf.URL)
+	require.ElementsMatch(t,
+		[]filterapi.MCPContentFilterScope{
+			filterapi.MCPContentFilterScopeRequest,
+			filterapi.MCPContentFilterScopeResponse,
+		},
+		cf.Scopes,
+	)
+	require.Equal(t, int32(30), cf.TimeoutSeconds)
+	require.Equal(t, filterapi.MCPContentFilterFailurePolicyFail, cf.FailurePolicy)
+	require.Equal(t, []string{"x-ticket-id", "x-request-id"}, cf.ForwardHeaders)
+}
+
+func Test_mcpConfig_ContentFilter_Defaults(t *testing.T) {
+	// When TimeoutSeconds and FailurePolicy are unset on the CRD, the
+	// translated config must expose them as zero values so that
+	// compileContentFilter can apply its defaults (10s / PassThrough).
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{
+						Name: gwapiv1.ObjectName("b"),
+					},
+					ContentFilter: &aigv1a1.MCPContentFilterConfig{
+						URL:    "https://cf.example.com",
+						Scopes: []aigv1a1.MCPContentFilterScope{aigv1a1.MCPContentFilterScopeRequest},
+					},
+				}},
+			},
+		},
+	}
+	mc, effective, err := mcpConfig(mcpRoutes, nil)
+	require.NoError(t, err)
+	require.True(t, effective)
+	cf := mc.Routes[0].Backends[0].ContentFilter
+	require.NotNil(t, cf)
+	require.Equal(t, int32(0), cf.TimeoutSeconds)
+	require.Equal(t, filterapi.MCPContentFilterFailurePolicy(""), cf.FailurePolicy)
+	require.Empty(t, cf.ForwardHeaders)
+}
+
+// newMCPContentFilter builds a standalone MCPContentFilter targeting the
+// given route and (optionally) a specific backend via sectionName. Used by
+// the precedence / conflict tests below.
+func newMCPContentFilter(namespace, name, routeName string, sectionName *string, url string) aigv1a1.MCPContentFilter {
+	// gwapiv1a2.LocalPolicyTargetReferenceWithSectionName is a defined type
+	// whose underlying struct embeds the *v1* variant of
+	// LocalPolicyTargetReference (both versions alias the same shape, but
+	// the struct literal has to match the underlying type exactly).
+	refs := []gwapiv1a2.LocalPolicyTargetReferenceWithSectionName{{
+		LocalPolicyTargetReference: gwapiv1.LocalPolicyTargetReference{
+			Group: aigv1a1.GroupName,
+			Kind:  "MCPRoute",
+			Name:  gwapiv1.ObjectName(routeName),
+		},
+	}}
+	if sectionName != nil {
+		sn := gwapiv1.SectionName(*sectionName)
+		refs[0].SectionName = &sn
+	}
+	return aigv1a1.MCPContentFilter{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace},
+		Spec: aigv1a1.MCPContentFilterSpec{
+			TargetRefs: refs,
+			MCPContentFilterConfig: aigv1a1.MCPContentFilterConfig{
+				URL: url,
+				Scopes: []aigv1a1.MCPContentFilterScope{
+					aigv1a1.MCPContentFilterScopeRequest,
+					aigv1a1.MCPContentFilterScopeResponse,
+				},
+			},
+		},
+	}
+}
+
+// Test_mcpConfig_ContentFilter_Standalone verifies that a standalone
+// MCPContentFilter with a sectionName attaches only to the matching backend.
+func Test_mcpConfig_ContentFilter_Standalone(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{
+					{BackendObjectReference: gwapiv1.BackendObjectReference{Name: "supportgpt"}},
+					{BackendObjectReference: gwapiv1.BackendObjectReference{Name: "plain"}},
+				},
+			},
+		},
+	}
+	section := "supportgpt"
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("ns", "cf1", "route", &section, "http://cf.example.com/filter"),
+	}
+
+	mc, effective, err := mcpConfig(mcpRoutes, filters)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.Len(t, mc.Routes[0].Backends, 2)
+
+	var withCF, withoutCF *filterapi.MCPBackend
+	for i := range mc.Routes[0].Backends {
+		b := &mc.Routes[0].Backends[i]
+		switch b.Name {
+		case "supportgpt":
+			withCF = b
+		case "plain":
+			withoutCF = b
+		}
+	}
+	require.NotNil(t, withCF)
+	require.NotNil(t, withoutCF)
+	require.NotNil(t, withCF.ContentFilter, "standalone filter must attach to the targeted backend")
+	require.Equal(t, "http://cf.example.com/filter", withCF.ContentFilter.URL)
+	require.Nil(t, withoutCF.ContentFilter, "other backends on the same route must not receive the filter")
+}
+
+// Test_mcpConfig_ContentFilter_StandaloneRouteWide verifies that a target ref
+// without a sectionName attaches to every backend on the targeted route.
+func Test_mcpConfig_ContentFilter_StandaloneRouteWide(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{
+					{BackendObjectReference: gwapiv1.BackendObjectReference{Name: "a"}},
+					{BackendObjectReference: gwapiv1.BackendObjectReference{Name: "b"}},
+				},
+			},
+		},
+	}
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("ns", "cf-all", "route", nil, "http://cf.example.com/filter"),
+	}
+
+	mc, effective, err := mcpConfig(mcpRoutes, filters)
+	require.NoError(t, err)
+	require.True(t, effective)
+	for _, b := range mc.Routes[0].Backends {
+		require.NotNilf(t, b.ContentFilter, "backend %q expected to inherit route-wide filter", b.Name)
+		require.Equal(t, "http://cf.example.com/filter", b.ContentFilter.URL)
+	}
+}
+
+// Test_mcpConfig_ContentFilter_Precedence verifies that when both inline and
+// standalone filters select the same backend, the standalone value wins.
+func Test_mcpConfig_ContentFilter_Precedence(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{Name: "supportgpt"},
+					ContentFilter: &aigv1a1.MCPContentFilterConfig{
+						URL:    "http://inline.example.com/filter",
+						Scopes: []aigv1a1.MCPContentFilterScope{aigv1a1.MCPContentFilterScopeRequest},
+					},
+				}},
+			},
+		},
+	}
+	section := "supportgpt"
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("ns", "cf-override", "route", &section, "http://standalone.example.com/filter"),
+	}
+	mc, effective, err := mcpConfig(mcpRoutes, filters)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.NotNil(t, mc.Routes[0].Backends[0].ContentFilter)
+	require.Equal(t, "http://standalone.example.com/filter", mc.Routes[0].Backends[0].ContentFilter.URL,
+		"standalone MCPContentFilter must override any inline value on conflict")
+}
+
+// Test_mcpConfig_ContentFilter_Conflict verifies that two standalone filters
+// selecting the same (route, backend) pair are rejected with an error.
+func Test_mcpConfig_ContentFilter_Conflict(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{Name: "b"},
+				}},
+			},
+		},
+	}
+	section := "b"
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("ns", "cf1", "route", &section, "http://a.example.com/filter"),
+		newMCPContentFilter("ns", "cf2", "route", &section, "http://b.example.com/filter"),
+	}
+	_, _, err := mcpConfig(mcpRoutes, filters)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "multiple MCPContentFilter")
+	require.Contains(t, err.Error(), "ns/cf1")
+	require.Contains(t, err.Error(), "ns/cf2")
+}
+
+// Test_mcpConfig_ContentFilter_NamespaceScoped verifies that a standalone
+// filter in a different namespace is ignored (MCPContentFilter attaches only
+// to MCPRoutes in its own namespace).
+func Test_mcpConfig_ContentFilter_NamespaceScoped(t *testing.T) {
+	mcpRoutes := []aigv1a1.MCPRoute{
+		{
+			ObjectMeta: metav1.ObjectMeta{Name: "route", Namespace: "ns"},
+			Spec: aigv1a1.MCPRouteSpec{
+				BackendRefs: []aigv1a1.MCPRouteBackendRef{{
+					BackendObjectReference: gwapiv1.BackendObjectReference{Name: "b"},
+				}},
+			},
+		},
+	}
+	section := "b"
+	filters := []aigv1a1.MCPContentFilter{
+		newMCPContentFilter("other-ns", "cf-stray", "route", &section, "http://stray.example.com/filter"),
+	}
+	mc, effective, err := mcpConfig(mcpRoutes, filters)
+	require.NoError(t, err)
+	require.True(t, effective)
+	require.Nil(t, mc.Routes[0].Backends[0].ContentFilter,
+		"cross-namespace MCPContentFilter must not attach")
 }
 
 func Test_mergeHeaderMutations(t *testing.T) {
@@ -2045,6 +2621,148 @@ func Test_bodyMutationToFilterAPI(t *testing.T) {
 			if d := cmp.Diff(tt.expected, result); d != "" {
 				t.Errorf("bodyMutationToFilterAPI() mismatch (-expected +got):\n%s", d)
 			}
+		})
+	}
+}
+
+// TestGatewayController_reconcileFilterConfigSecret_GlobalDefaults tests that
+// global LLM request costs from GatewayConfig are properly included in the filter config
+// when no routes override them.
+func TestGatewayController_reconcileFilterConfigSecret_GlobalDefaults(t *testing.T) {
+	tests := []struct {
+		name                     string
+		globalCosts              []aigv1b1.LLMRequestCost
+		routes                   []aigv1b1.AIGatewayRoute
+		expectedGlobalCosts      []filterapi.GlobalLLMRequestCost
+		expectedRouteScopedCosts []filterapi.LLMRequestCost
+	}{
+		{
+			name: "global defaults only, no routes",
+			globalCosts: []aigv1b1.LLMRequestCost{
+				{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeInputToken},
+			},
+			routes: []aigv1b1.AIGatewayRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "route1", Namespace: "ns"},
+					Spec: aigv1b1.AIGatewayRouteSpec{
+						Rules: []aigv1b1.AIGatewayRouteRule{
+							{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "backend1"}}},
+						},
+					},
+				},
+			},
+			expectedGlobalCosts: []filterapi.GlobalLLMRequestCost{
+				{MetadataKey: "billing_charges", Type: filterapi.LLMRequestCostTypeInputToken},
+			},
+			expectedRouteScopedCosts: nil, // No route-scoped costs
+		},
+		{
+			name: "global defaults with route override",
+			globalCosts: []aigv1b1.LLMRequestCost{
+				{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeInputToken},
+				{MetadataKey: "total_tokens", Type: aigv1b1.LLMRequestCostTypeTotalToken},
+			},
+			routes: []aigv1b1.AIGatewayRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "premium-route", Namespace: "ns"},
+					Spec: aigv1b1.AIGatewayRouteSpec{
+						Rules: []aigv1b1.AIGatewayRouteRule{
+							{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "backend1"}}},
+						},
+						LLMRequestCosts: []aigv1b1.LLMRequestCost{
+							{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeOutputToken}, // Override global
+						},
+					},
+				},
+			},
+			expectedGlobalCosts: []filterapi.GlobalLLMRequestCost{
+				{MetadataKey: "billing_charges", Type: filterapi.LLMRequestCostTypeInputToken},
+				{MetadataKey: "total_tokens", Type: filterapi.LLMRequestCostTypeTotalToken},
+			},
+			expectedRouteScopedCosts: []filterapi.LLMRequestCost{
+				{MetadataKey: "billing_charges", RouteName: "ns/premium-route", Type: filterapi.LLMRequestCostTypeOutputToken},
+			},
+		},
+		{
+			name: "multiple routes with different overrides",
+			globalCosts: []aigv1b1.LLMRequestCost{
+				{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeInputToken},
+			},
+			routes: []aigv1b1.AIGatewayRoute{
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "free-route", Namespace: "ns"},
+					Spec: aigv1b1.AIGatewayRouteSpec{
+						Rules: []aigv1b1.AIGatewayRouteRule{
+							{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "backend1"}}},
+						},
+						LLMRequestCosts: []aigv1b1.LLMRequestCost{
+							{MetadataKey: "billing_charges", Type: aigv1b1.LLMRequestCostTypeCEL, CEL: ptr.To("0")}, // Free
+						},
+					},
+				},
+				{
+					ObjectMeta: metav1.ObjectMeta{Name: "standard-route", Namespace: "ns"},
+					Spec: aigv1b1.AIGatewayRouteSpec{
+						Rules: []aigv1b1.AIGatewayRouteRule{
+							{BackendRefs: []aigv1b1.AIGatewayRouteRuleBackendRef{{Name: "backend1"}}},
+						},
+						// No override - will use global default
+					},
+				},
+			},
+			expectedGlobalCosts: []filterapi.GlobalLLMRequestCost{
+				{MetadataKey: "billing_charges", Type: filterapi.LLMRequestCostTypeInputToken},
+			},
+			expectedRouteScopedCosts: []filterapi.LLMRequestCost{
+				{MetadataKey: "billing_charges", RouteName: "ns/free-route", Type: filterapi.LLMRequestCostTypeCEL, CEL: "0"},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fakeClient := requireNewFakeClientWithIndexes(t)
+			kube := fake2.NewClientset()
+			ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zap.Options{Development: true, Level: zapcore.DebugLevel})))
+			c := NewGatewayController(fakeClient, kube, ctrl.Log,
+				"docker.io/envoyproxy/ai-gateway-extproc:latest", "info", false, nil, true)
+
+			const gwNamespace = "ns"
+
+			// Create AIServiceBackend
+			backend := &aigv1b1.AIServiceBackend{
+				ObjectMeta: metav1.ObjectMeta{Name: "backend1", Namespace: gwNamespace},
+				Spec: aigv1b1.AIServiceBackendSpec{
+					BackendRef: gwapiv1.BackendObjectReference{Name: "some-backend", Namespace: ptr.To[gwapiv1.Namespace](gwNamespace)},
+				},
+			}
+			err := fakeClient.Create(t.Context(), backend)
+			require.NoError(t, err)
+
+			const someNamespace = "some-namespace"
+			configName := FilterConfigSecretPerGatewayName("gw", gwNamespace)
+			effective, err := c.reconcileFilterConfigSecret(t.Context(), configName, someNamespace, tt.routes, nil, nil, "test-uuid", tt.globalCosts)
+			require.NoError(t, err)
+			require.True(t, effective)
+
+			secret, err := kube.CoreV1().Secrets(someNamespace).Get(t.Context(), configName, metav1.GetOptions{})
+			require.NoError(t, err)
+			configStr, ok := secret.StringData[FilterConfigKeyInSecret]
+			require.True(t, ok)
+
+			var fc filterapi.Config
+			require.NoError(t, yaml.Unmarshal([]byte(configStr), &fc))
+
+			// Compare global costs (order-agnostic)
+			if diff := cmp.Diff(tt.expectedGlobalCosts, fc.GlobalLLMRequestCosts,
+				cmpopts.SortSlices(func(a, b filterapi.GlobalLLMRequestCost) bool {
+					return a.MetadataKey < b.MetadataKey
+				})); diff != "" {
+				t.Errorf("GlobalLLMRequestCosts mismatch (-want +got):\n%s", diff)
+			}
+
+			// Compare route-scoped costs (order-agnostic)
+			requireLLMRequestCostsEqual(t, tt.expectedRouteScopedCosts, fc.LLMRequestCosts)
 		})
 	}
 }

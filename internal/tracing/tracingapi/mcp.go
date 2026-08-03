@@ -32,6 +32,19 @@ type MCPTracer interface {
 type MCPSpan interface {
 	// RecordRouteToBackend records the backend that was routed to.
 	RecordRouteToBackend(backend string, session string, isNew bool)
+	// RecordResponseOutput records the JSON-encoded result of the MCP
+	// request as the span's output. The argument is the raw bytes of
+	// the JSON-RPC `result` (or empty/nil when there is none -- e.g.
+	// JSON-RPC error responses). Implementations promote this to the
+	// OpenInference / Langfuse `output.value` and
+	// `langfuse.observation.output` attributes so the result shows up
+	// natively in the Langfuse trace UI. Implementations MUST truncate
+	// oversized payloads so a chatty backend cannot blow up OTLP export
+	// payloads. Implementations MUST be safe to call after the span has
+	// already recorded its output (subsequent calls are no-ops) so
+	// proxy paths that may decode the same response twice do not double-
+	// emit the attribute.
+	RecordResponseOutput(result []byte)
 	// EndSpan finalizes and ends the span.
 	EndSpan()
 	// EndSpanOnError finalizes and ends the span with an error status.

@@ -1,0 +1,35 @@
+# Copyright Envoy AI Gateway Authors
+# SPDX-License-Identifier: Apache-2.0
+# The full text of the Apache license is available in the LICENSE file at
+# the root of the repo.
+#
+# Asserts that MCPContentFilter.policies is a closed enum. Only the
+# values declared on MCPContentFilterPolicy (`pii`, `evalpolicy`)
+# should be accepted; anything else must be rejected by the API
+# server so operators catch typos before the filter silently no-ops.
+
+apiVersion: aigateway.envoyproxy.io/v1alpha1
+kind: MCPRoute
+metadata:
+  name: content-filter-invalid-policy
+  namespace: default
+spec:
+  parentRefs:
+    - name: some-gateway
+      kind: Gateway
+      group: gateway.networking.k8s.io
+  backendRefs:
+    - name: mcp-service
+      kind: Service
+      port: 80
+      path: /mcp
+      toolSelector:
+        include:
+          - run
+      contentFilter:
+        url: https://content-filter.default.svc.cluster.local:8443/filter
+        scopes:
+          - Response
+        policies:
+          - pii
+          - not-a-real-policy

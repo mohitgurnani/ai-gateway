@@ -1,0 +1,226 @@
+# AI Gateway monitoring stack for 10.113.24.33.
+#
+# Phases (see README.md for full history):
+#   P2  otel-collector (passthrough) + Prometheus + Grafana + blackbox-exporter
+#   P3  baggage propagation + Langfuse-native attributes (gateway code)
+#   P3d cutover: gateways now export OTLP through this collector, not direct
+#   P4  Alertmanager + 8 alert rules + native Slack webhook delivery
+#   P5  cAdvisor + node-exporter + process-exporter (container/host/FD metrics)
+#
+# Why ports 4327/4328 instead of 4317/4318:
+# the host already runs a SigNoz collector that binds 4317/4318. Internal
+# container ports stay 4317/4318 so default OTLP clients work unchanged.
+
+name: aigw-monitoring
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  prometheus-data: {}
+  grafana-data: {}
+  alertmanager-data: {}
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.117.0
+    container_name: aigw-mon-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol-contrib/config.yaml"]
+    environment:
+      LANGFUSE_AUTH_B64: ${LANGFUSE_AUTH_B64}
+    volumes:
+      - ./otel-collector/config.yaml:/etc/otelcol-contrib/config.yaml:ro
+    ports:
+      - "4327:4317"   # OTLP gRPC (host 4327 to avoid SigNoz on 4317)
+      - "4328:4318"   # OTLP HTTP  (host 4328 to avoid SigNoz on 4318)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "/otelcol-contrib", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: aigw-mon-prometheus
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=14d"
+      - "--web.enable-remote-write-receiver"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./prometheus/rules:/etc/prometheus/rules:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9091:9090"   # host 9091 to avoid clashes; container internal stays 9090
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9090/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: aigw-mon-grafana
+    restart: unless-stopped
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD:-aigw-mon}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_INSTALL_PLUGINS: ""
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3030:3000"
+    networks: [monitoring]
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health | grep -q '\"database\": \"ok\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: aigw-mon-alertmanager
+    restart: unless-stopped
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+      - "--web.external-url=http://10.113.24.33:9095"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      # Slack Incoming Webhook URL is bind-mounted as a read-only secret;
+      # alertmanager.yml references it via global.slack_api_url_file.
+      - ./alertmanager/secrets:/etc/alertmanager/secrets:ro
+      - alertmanager-data:/alertmanager
+    ports:
+      - "9095:9093"
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9093/-/ready"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  blackbox:
+    image: prom/blackbox-exporter:v0.25.0
+    container_name: aigw-mon-blackbox
+    restart: unless-stopped
+    command: ["--config.file=/etc/blackbox_exporter/config.yml"]
+    volumes:
+      - ./blackbox/blackbox.yml:/etc/blackbox_exporter/config.yml:ro
+    ports:
+      - "9115:9115"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9115/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # P5: container-level metrics (CPU, memory, network, FS, FDs) for every
+  # container on the host, including the gateways and all panacea-* MCPs.
+  # cAdvisor exposes:
+  #   - container_cpu_usage_seconds_total
+  #   - container_memory_working_set_bytes / container_memory_usage_bytes
+  #   - container_network_{receive,transmit}_bytes_total
+  #   - container_fs_usage_bytes
+  #   - container_file_descriptors  <-- per-MCP FD count requested by ops
+  #   - container_processes
+  #   - container_start_time_seconds (for uptime / restart detection)
+  cadvisor:
+    # v0.49.1 had trouble naming containers under cgroupv2 + systemd driver.
+    # v0.51.0 fixes the docker name resolution against /system.slice/docker-*.scope
+    # cgroup paths used by Ubuntu 24.04. We also pass the containerd socket so
+    # cAdvisor can resolve container metadata for the runtime actually in use.
+    image: gcr.io/cadvisor/cadvisor:v0.51.0
+    container_name: aigw-mon-cadvisor
+    restart: unless-stopped
+    privileged: true
+    command:
+      - "--housekeeping_interval=15s"
+      - "--store_container_labels=false"
+      - "--whitelisted_container_labels=io.kubernetes.container.name,com.docker.compose.project,com.docker.compose.service"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+      - /run/containerd/containerd.sock:/run/containerd/containerd.sock:ro
+    devices:
+      - /dev/kmsg
+    ports:
+      - "8085:8080"
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # P5: host-level metrics (CPU, memory, load, disk, network) so we can
+  # contextualize per-container usage against host capacity.
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: aigw-mon-node-exporter
+    restart: unless-stopped
+    pid: host
+    command:
+      - "--path.rootfs=/host"
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)"
+      - "--collector.processes"
+    volumes:
+      - /:/host:ro,rslave
+    ports:
+      - "9100:9100"
+    networks: [monitoring]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9100/metrics"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # P5: per-process metrics. cAdvisor used to expose container_file_descriptors
+  # but dropped that metric in v0.51.0; we now derive per-process FD counts from
+  # process-exporter (it walks /proc on the host and groups by configured names),
+  # which also gives us per-MCP CPU/RSS in addition to the cAdvisor view.
+  #
+  # NOTE on healthcheck: ncabatoff/process-exporter is a scratch image with no
+  # shell or wget. Prometheus scrapes /metrics directly, and the container exits
+  # if the listener fails, so we don't bother with an HTTP healthcheck — adding
+  # one with `wget` permanently marks the container "unhealthy" even though it
+  # is functioning correctly.
+  process-exporter:
+    image: ncabatoff/process-exporter:0.8.7
+    container_name: aigw-mon-process-exporter
+    restart: unless-stopped
+    privileged: true
+    command:
+      - "--procfs=/host/proc"
+      - "--config.path=/config/process-exporter.yml"
+    volumes:
+      - /proc:/host/proc:ro
+      - ./process-exporter/process-exporter.yml:/config/process-exporter.yml:ro
+    ports:
+      - "9256:9256"
+    networks: [monitoring]

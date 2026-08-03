@@ -31,6 +31,7 @@ import (
 	"github.com/envoyproxy/ai-gateway/internal/internalapi"
 	"github.com/envoyproxy/ai-gateway/internal/json"
 	"github.com/envoyproxy/ai-gateway/internal/metrics"
+	"github.com/envoyproxy/ai-gateway/internal/tracing"
 	"github.com/envoyproxy/ai-gateway/internal/tracing/tracingapi"
 	"github.com/envoyproxy/ai-gateway/internal/version"
 )
@@ -199,6 +200,22 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 		applicationError bool
 		result           handlerResult
 	)
+	// Phase A — capture client-network identity (X-Forwarded-For if the
+	// immediate peer is in MCP_TRUSTED_PROXY_CIDRS, otherwise
+	// r.RemoteAddr) onto the request context so the tracing layer can
+	// emit `client.address`, `client.address.kind`, and a fallback
+	// `user.id = "ip:<addr>"` for callers that did not set baggage
+	// `user`. We do this once at the top of the request so every span
+	// kicked off during this handler invocation sees the same value
+	// without re-parsing the request.
+	//
+	// Phase B TODO: remove once Okta-verified identity is the trusted
+	// source for `user.id` and `auth.kind`. See
+	// internal/tracing/clientaddr.go and
+	// docs/telemetry-rollout-tracker.md.
+	if addr, kind := tracing.PickClientAddr(r); kind != "" {
+		ctx = tracing.WithClientAddr(ctx, addr, kind)
+	}
 	defer func() {
 		if m.l.Enabled(ctx, slog.LevelDebug) {
 			m.l.Debug("Completed MCP POST request",
@@ -319,7 +336,7 @@ func (m *mcpRequestContext) servePOST(w http.ResponseWriter, r *http.Request) {
 				onErrorResponse(w, http.StatusBadRequest, "invalid params")
 				return
 			}
-			err = m.handleNotificationsRootsListChanged(ctx, s, w, msg, span)
+			err = m.handleNotificationsRootsListChanged(ctx, s, w, msg, params, span)
 		case "completion/complete":
 			params = &mcp.CompleteParams{}
 			span, err = parseParamsAndMaybeStartSpan(ctx, m, msg, params, r.Header)
@@ -660,7 +677,7 @@ func (m *mcpRequestContext) handleClientToServerResponse(ctx context.Context, s 
 		onErrorResponse(w, http.StatusNotFound, fmt.Sprintf("unknown backend %s", backendName))
 		return result, fmt.Errorf("%w: unknown backend %s", errBackendNotFound, backendName)
 	}
-	resp, err := m.invokeJSONRPCRequest(ctx, s.route, backend, cse, res)
+	resp, err := m.invokeJSONRPCRequest(ctx, s.route, backend, cse, res, nil)
 	if err != nil {
 		onErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("failed to send: %v", err))
 		return result, err
@@ -746,7 +763,60 @@ func (m *mcpRequestContext) handleToolCallRequest(ctx context.Context, s *sessio
 		span.RecordRouteToBackend(backend.Name, string(cse.sessionID), false)
 	}
 	req.Params = param
-	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req)
+
+	// Optionally invoke the per-backend content filter at Request scope
+	// before dispatching the call to the backend. The filter may rewrite
+	// the request params or reject the call entirely.
+	//
+	// We always emit the X-Content-Filter-Status response header and the
+	// matching mcp_filter_status_total counter for this (route, backend),
+	// regardless of filter outcome — L04 contract: every proxied response
+	// carries the header. The only case where this handler does NOT emit
+	// it is the happy path that flows into invokeAndProxyResponse, which
+	// takes responsibility for the header on the downstream hop (see
+	// proxyResponseBody).
+	if cf := route.contentFilters[backendName]; cf != nil && cf.invokeOnRequest {
+		headers := r.Header
+		if headers == nil {
+			headers = m.requestHeaders
+		}
+		filtered, cfStatus, cfErr := applyContentFilterOnRequestWithStatus(ctx, m.contentFilterLogger(), &m.client, cf,
+			s.route, backendName, toolName, req, headers)
+		if cfErr != nil {
+			switch {
+			case errors.Is(cfErr, errContentFilterRejected):
+				writeFilterStatus(w, s.route, backendName, cfStatus)
+				writeJSONRPCErrorResponse(w, req.ID, contentFilterErrorCodeRejected, "content filter rejected request", cfErr.Error())
+				return result, cfErr
+			case errors.Is(cfErr, errContentFilterFailed):
+				writeFilterStatus(w, s.route, backendName, cfStatus)
+				writeJSONRPCErrorResponse(w, req.ID, contentFilterErrorCodeUnavailable, "content filter unavailable", cfErr.Error())
+				return result, cfErr
+			default:
+				m.l.Error("content filter request processing error",
+					slog.String("error", cfErr.Error()), slog.String("backend", backendName), slog.String("tool", toolName))
+				if cf.failClosed {
+					writeFilterStatus(w, s.route, backendName, cfStatus)
+					writeJSONRPCErrorResponse(w, req.ID, contentFilterErrorCodeUnavailable, "content filter processing error", cfErr.Error())
+					return result, cfErr
+				}
+				// fail-open: proceed with the original request. The Response-scope
+				// header emission on proxyResponseBody will overwrite any speculative
+				// write we did here — but if there is no response-scope filter
+				// configured, we still want to record this request-scope outcome.
+			}
+		} else if filtered != nil {
+			req = filtered
+		}
+		// Stash the request-scope outcome on the request context so
+		// that downstream paths that don't invoke the Response-scope
+		// filter still emit a status header for the proxied response.
+		m.reqScopeFilterStatus = cfStatus
+		m.reqScopeFilterRoute = s.route
+		m.reqScopeFilterBackend = backendName
+	}
+
+	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req, p)
 }
 
 func copyProxyHeaders(resp *http.Response, w http.ResponseWriter) {
@@ -797,6 +867,39 @@ func (m *mcpRequestContext) proxyResponseBody(ctx context.Context, s *session, w
 					}
 					msg.ID = req.ID
 
+					// Only consult the Response-scope content filter when we
+					// have a session (and thus a route) to look it up on.
+					// Test scaffolding in the package sometimes drives
+					// proxyResponseBody with a nil session, which should
+					// behave exactly as "no filter configured".
+					if s != nil {
+						filtered, cfStatus, cfErr := m.applyResponseContentFilterWithStatus(ctx, s.route, backend.Name, req, msg)
+						if cfErr != nil {
+							// Emit X-Content-Filter-Status BEFORE calling
+							// writeJSONRPCErrorResponse: that helper calls
+							// w.WriteHeader internally, so any header we set
+							// after it would be ignored.
+							writeFilterStatus(w, s.route, backend.Name, cfStatus)
+							// Emit a JSON-RPC error response to the client in place
+							// of the backend response. Do NOT set Content-Length
+							// here; writeJSONRPCErrorResponse will do so.
+							if errors.Is(cfErr, errContentFilterRejected) {
+								writeJSONRPCErrorResponse(w, req.ID, contentFilterErrorCodeRejected, "content filter rejected response", cfErr.Error())
+							} else {
+								writeJSONRPCErrorResponse(w, req.ID, contentFilterErrorCodeUnavailable, "content filter unavailable", cfErr.Error())
+							}
+							return cfErr
+						}
+						if filtered != nil {
+							msg = filtered
+						}
+						// Success path: Response-scope outcome overrides
+						// any Request-scope outcome we stashed earlier.
+						m.reqScopeFilterStatus = cfStatus
+						m.reqScopeFilterRoute = s.route
+						m.reqScopeFilterBackend = backend.Name
+					}
+
 					// Check if this is a JSON-RPC error response
 					if msg.Error != nil {
 						responseError = msg.Error
@@ -806,12 +909,23 @@ func (m *mcpRequestContext) proxyResponseBody(ctx context.Context, s *session, w
 					}
 
 					body, _ = jsonrpc.EncodeMessage(msg)
+					// Promote the response payload onto the OTel/MCP
+					// span as Langfuse-native output (input.value /
+					// output.value etc.) before the span is ended in
+					// servePOST's defer block. This is the
+					// application/json fast path; the SSE fallback
+					// path below makes the same call. RecordResponseOutput
+					// is idempotent per span so no duplicate emission.
+					m.recordSpanOutput(msg)
 				}
 				m.recordResponse(ctx, msg)
 			}
 
 			// We need to update the content length since we might have modified the ID.
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+			// Emit X-Content-Filter-Status before WriteHeader (after
+			// WriteHeader the response headers are frozen).
+			m.emitStashedFilterStatus(w)
 			w.WriteHeader(resp.StatusCode)
 			_, _ = w.Write(body)
 
@@ -830,6 +944,12 @@ func (m *mcpRequestContext) proxyResponseBody(ctx context.Context, s *session, w
 	if m.l.Enabled(ctx, slog.LevelDebug) {
 		m.l.Debug("Starting to stream MCP response body", slog.String("content_type", resp.Header.Get("Content-Type")), slog.String("mcp_session_id", resp.Header.Get(sessionIDHeader)))
 	}
+	// Emit X-Content-Filter-Status before the SSE stream's initial
+	// WriteHeader. For SSE we cannot amend the header once the stream
+	// starts, so the value reflects the Request-scope outcome stash (if
+	// any). Per-event Response-scope outcomes for SSE still record their
+	// own mcp_filter_status_total metric inside the event loop below.
+	m.emitStashedFilterStatus(w)
 	w.WriteHeader(resp.StatusCode)
 	// For single-backend operations, metrics are recorded in the defer of servePOST,
 	// so we don't need to track startAt in events here.
@@ -868,6 +988,34 @@ func (m *mcpRequestContext) proxyResponseBody(ctx context.Context, s *session, w
 						}
 						msg.ID = req.ID
 
+						// Content filter: mutate the pointer in-place so that
+						// the SSE event writer (which encodes messages at
+						// flush time) emits the rewritten payload. Skip when
+						// the session is nil (test scaffolding) because the
+						// filter lookup is keyed by route on the session.
+						if s != nil {
+							filtered, cfStatus, cfErr := m.applyResponseContentFilterWithStatus(ctx, s.route, backend.Name, req, msg)
+							// SSE cannot amend the top-level response header
+							// per-event, so we emit the per-event outcome to
+							// the mcp_filter_status_total counter only.
+							if pm := filterMetricsLoad(); pm != nil {
+								pm.RecordStatus(s.route, backend.Name, string(cfStatus))
+							}
+							if cfErr != nil {
+								errCode := contentFilterErrorCodeRejected
+								if !errors.Is(cfErr, errContentFilterRejected) {
+									errCode = contentFilterErrorCodeUnavailable
+								}
+								msg.Error = &jsonrpc.Error{Code: errCode, Message: "content filter blocked response"}
+								msg.Result = nil
+							} else if filtered != nil && filtered != msg {
+								// Copy filtered fields onto the original pointer so
+								// the event's messages slice sees the update.
+								msg.Result = filtered.Result
+								msg.Error = filtered.Error
+							}
+						}
+
 						// Check if this is a JSON-RPC error response
 						if msg.Error != nil {
 							// Collect error to return to caller
@@ -876,6 +1024,12 @@ func (m *mcpRequestContext) proxyResponseBody(ctx context.Context, s *session, w
 							// Check if this is a tools/call response with isError=true
 							responseErrors = append(responseErrors, toolErr)
 						}
+						// SSE path mirror of the JSON fast path: emit
+						// the response payload as Langfuse output on
+						// the in-flight span. Gated on req != nil so
+						// we only emit for the user-initiated request,
+						// not for unrelated server->client SSE events.
+						m.recordSpanOutput(msg)
 					}
 					m.recordResponse(ctx, msg)
 				}
@@ -1027,6 +1181,36 @@ func (m *mcpRequestContext) maybeServerToClientRequestModify(ctx context.Context
 	return nil
 }
 
+// recordSpanOutput promotes the upstream JSON-RPC response payload onto
+// the per-request OTel span as Langfuse-native and OpenInference output
+// attributes. It is a no-op when:
+//   - tracing is disabled or no span was created for this request;
+//   - the response is nil (defensive);
+//   - the response carries no result and no error.
+//
+// For success responses we emit `msg.Result` (the raw JSON of the
+// JSON-RPC `result`) so Langfuse renders the actual tool output in its
+// trace UI. For JSON-RPC error responses we emit the encoded error
+// envelope (`{code, message, data}`) so failure traces still show the
+// remote error verbatim, which is the common debugging case for
+// ENG/ONCALL tickets. The underlying RecordResponseOutput on the span
+// is idempotent, so calling this from both the JSON and SSE response
+// paths (which can both touch the same logical reply) is safe.
+func (m *mcpRequestContext) recordSpanOutput(msg *jsonrpc.Response) {
+	if m == nil || m.currentSpan == nil || msg == nil {
+		return
+	}
+	if len(msg.Result) > 0 {
+		m.currentSpan.RecordResponseOutput([]byte(msg.Result))
+		return
+	}
+	if msg.Error != nil {
+		if raw, err := json.Marshal(msg.Error); err == nil {
+			m.currentSpan.RecordResponseOutput(raw)
+		}
+	}
+}
+
 func (m *mcpRequestContext) recordResponse(ctx context.Context, rawMsg jsonrpc.Message) {
 	switch msg := rawMsg.(type) {
 	case *jsonrpc.Response:
@@ -1095,7 +1279,7 @@ func (m *mcpRequestContext) handleResourceReadRequest(ctx context.Context, s *se
 		logger.Debug("Routing to backend")
 	}
 	req.Params = param
-	return result, m.invokeAndProxyResponse(ctx, s, w, backend, sess, req)
+	return result, m.invokeAndProxyResponse(ctx, s, w, backend, sess, req, p)
 }
 
 // handleResourcesSubscribeRequest handles the "resources/subscribe" JSON-RPC method.
@@ -1109,7 +1293,7 @@ func (m *mcpRequestContext) handleResourcesUnsubscribeRequest(ctx context.Contex
 }
 
 func (m *mcpRequestContext) handleResourcesSubscriptionRequest(ctx context.Context, s *session, w http.ResponseWriter,
-	req *jsonrpc.Request, p interface{}, // *mcp.SubscribeParams or *mcp.UnsubscribeParams.
+	req *jsonrpc.Request, p mcp.Params, // *mcp.SubscribeParams or *mcp.UnsubscribeParams.
 	span tracingapi.MCPSpan,
 ) (handlerResult, error) {
 	var uri string
@@ -1160,7 +1344,7 @@ func (m *mcpRequestContext) handleResourcesSubscriptionRequest(ctx context.Conte
 		span.RecordRouteToBackend(backend.Name, string(cse.sessionID), false)
 	}
 	req.Params = param
-	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req)
+	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req, p)
 }
 
 var emptyJSONRPCMessage = []byte(`{}`)
@@ -1256,6 +1440,26 @@ func extractForwardHeaders(reqHeaders http.Header, headers []string) map[string]
 	return result
 }
 
+// extractPerBackendForwardHeaders reads per-backend header forwarding config from the incoming request.
+// It supports header renaming: each entry maps a source header to an optional destination header name.
+func extractPerBackendForwardHeaders(reqHeaders http.Header, mappings []filterapi.MCPHeaderForward) map[string]string {
+	if len(mappings) == 0 {
+		return nil
+	}
+
+	result := make(map[string]string)
+	for _, m := range mappings {
+		if value := reqHeaders.Get(m.Name); value != "" {
+			result[m.ForwardName()] = value
+		}
+	}
+
+	if len(result) == 0 {
+		return nil
+	}
+	return result
+}
+
 // handlePromptGetRequest handles the "prompts/get" JSON-RPC method.
 func (m *mcpRequestContext) handlePromptGetRequest(ctx context.Context, s *session, w http.ResponseWriter, req *jsonrpc.Request, p *mcp.GetPromptParams) (handlerResult, error) {
 	backendName, promptName, err := upstreamResourceName(p.Name)
@@ -1283,7 +1487,7 @@ func (m *mcpRequestContext) handlePromptGetRequest(ctx context.Context, s *sessi
 		logger.Debug("Routing to backend")
 	}
 	req.Params = param
-	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req)
+	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req, p)
 }
 
 func (m *mcpRequestContext) handleCompletionComplete(ctx context.Context, s *session, w http.ResponseWriter, req *jsonrpc.Request, param *mcp.CompleteParams, span tracingapi.MCPSpan) (handlerResult, error) {
@@ -1319,7 +1523,7 @@ func (m *mcpRequestContext) handleCompletionComplete(ctx context.Context, s *ses
 	if span != nil {
 		span.RecordRouteToBackend(backend.Name, string(cse.sessionID), false)
 	}
-	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req)
+	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req, param)
 }
 
 // handleClientToServerNotificationsProgress handles client-to-server progress notifications that require routing to a specific backend.
@@ -1394,13 +1598,13 @@ func (m *mcpRequestContext) handleClientToServerNotificationsProgress(ctx contex
 	if span != nil {
 		span.RecordRouteToBackend(backendName, string(cse.sessionID), false)
 	}
-	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req)
+	return result, m.invokeAndProxyResponse(ctx, s, w, backend, cse, req, p)
 }
 
 // invokeAndProxyResponse invokes the given JSON-RPC request to the given backend and proxies the response back to the client
 // via w ResponseWriter.
-func (m *mcpRequestContext) invokeAndProxyResponse(ctx context.Context, s *session, w http.ResponseWriter, backend filterapi.MCPBackend, sess *compositeSessionEntry, req *jsonrpc.Request) error {
-	resp, err := m.invokeJSONRPCRequest(ctx, s.route, backend, sess, req)
+func (m *mcpRequestContext) invokeAndProxyResponse(ctx context.Context, s *session, w http.ResponseWriter, backend filterapi.MCPBackend, sess *compositeSessionEntry, req *jsonrpc.Request, params mcp.Params) error {
+	resp, err := m.invokeJSONRPCRequest(ctx, s.route, backend, sess, req, params)
 	if err != nil {
 		onErrorResponse(w, http.StatusInternalServerError, fmt.Sprintf("call to %s failed: %v", backend.Name, err))
 		return err
@@ -1423,7 +1627,7 @@ func (m *mcpRequestContext) invokeAndProxyResponse(ctx context.Context, s *sessi
 }
 
 // addMCPHeaders adds the MCP metadata headers to the HTTP request.
-func addMCPHeaders(httpReq *http.Request, msg jsonrpc.Message, routeName filterapi.MCPRouteName, backendName filterapi.MCPBackendName) {
+func addMCPHeaders(httpReq *http.Request, msg jsonrpc.Message, params mcp.Params, routeName filterapi.MCPRouteName, backendName filterapi.MCPBackendName) {
 	// MCP backend header is used for upstream MCP routing.
 	httpReq.Header.Set(internalapi.MCPBackendHeader, backendName)
 	httpReq.Header.Set(internalapi.MCPRouteHeader, routeName)
@@ -1431,6 +1635,12 @@ func addMCPHeaders(httpReq *http.Request, msg jsonrpc.Message, routeName filtera
 		// MCP request headers are used to populate information in the envoy filter metadata.
 		httpReq.Header.Set(internalapi.MCPMetadataHeaderRequestID, fmt.Sprintf("%v", mcpReq.ID.Raw()))
 		httpReq.Header.Set(internalapi.MCPMetadataHeaderMethod, mcpReq.Method)
+
+		if params != nil {
+			if p, ok := params.(*mcp.CallToolParams); ok {
+				httpReq.Header.Set(internalapi.MCPMetadataHeaderToolName, p.Name)
+			}
+		}
 	}
 }
 
@@ -1459,7 +1669,7 @@ func sendToAllBackendsAndAggregateResponses[responseType any, paramsType mcp.Par
 
 	encoded, _ := json.Marshal(p)
 	request.Params = encoded
-	backendMsgs := s.sendToBackendsFiltered(ctx, http.MethodPost, request, span, filter)
+	backendMsgs := s.sendToBackendsFiltered(ctx, http.MethodPost, request, p, span, filter)
 	return sendToAllBackendsAndAggregateResponsesImpl(ctx, backendMsgs, m, w, s, request, p, mergeFn)
 }
 
@@ -1562,6 +1772,13 @@ func parseParamsAndMaybeStartSpan[paramType mcp.Params](ctx context.Context, m *
 	}
 
 	span := m.tracer.StartSpanAndInjectMeta(ctx, req, p, headers)
+	// Stash the span on the per-request context so the response path
+	// (proxyResponseBody / SSE relay) can later promote the upstream
+	// `result` payload onto the span as Langfuse output. Doing this in
+	// one central spot avoids touching the dozens of call sites that
+	// invoke parseParamsAndMaybeStartSpan from servePOST. See the
+	// `currentSpan` field on mcpRequestContext for the rationale.
+	m.currentSpan = span
 	return span, nil
 }
 
@@ -1682,12 +1899,120 @@ func (m *mcpRequestContext) mergePromptsList(_ *session, responses []broadCastRe
 }
 
 // handleNotificationsRootsListChanged handles the "notifications/roots/list_changed" JSON-RPC method.
-func (m *mcpRequestContext) handleNotificationsRootsListChanged(ctx context.Context, s *session, w http.ResponseWriter, req *jsonrpc.Request, span tracingapi.MCPSpan) error {
+func (m *mcpRequestContext) handleNotificationsRootsListChanged(ctx context.Context, s *session, w http.ResponseWriter, req *jsonrpc.Request, params mcp.Params, span tracingapi.MCPSpan) error {
 	// Since notifications request doesn't expect a response, we can just send the request to all backends and return 202 Accepted per the spec.
-	eventChan := s.sendToAllBackends(ctx, http.MethodPost, req, span)
+	eventChan := s.sendToAllBackends(ctx, http.MethodPost, req, params, span)
 	w.Header().Set(sessionIDHeader, string(s.clientGatewaySessionID()))
 	w.WriteHeader(http.StatusAccepted)
 	// Just wait for all requests to complete and return 202 Accepted. There should be events sent from the backends per the spec.
 	<-eventChan
 	return nil
+}
+
+// JSON-RPC error codes used when the content filter rejects a call or when
+// the filter service is unavailable and the policy is fail-closed. These
+// live in the implementation-defined server error range (-32000 to -32099)
+// as allowed by JSON-RPC 2.0 §5.1.
+const (
+	// contentFilterErrorCodeRejected is returned when a filter explicitly
+	// asks the gateway to reject a tool call.
+	contentFilterErrorCodeRejected int64 = -32010
+	// contentFilterErrorCodeUnavailable is returned when the filter service
+	// is unreachable or malfunctioning and the policy is fail-closed.
+	contentFilterErrorCodeUnavailable int64 = -32011
+)
+
+// contentFilterLogger returns a tiny logger shim used by the content filter
+// helpers. Keeping the shim pass-through means content filter logic can be
+// unit-tested without a real slog handler.
+func (m *mcpRequestContext) contentFilterLogger() *mcpLoggerShim {
+	if m == nil || m.l == nil {
+		return &mcpLoggerShim{}
+	}
+	return &mcpLoggerShim{warnFunc: func(msg string, kv ...any) {
+		attrs := make([]slog.Attr, 0, len(kv)/2)
+		for i := 0; i+1 < len(kv); i += 2 {
+			k, _ := kv[i].(string)
+			attrs = append(attrs, slog.Any(k, kv[i+1]))
+		}
+		m.l.LogAttrs(context.Background(), slog.LevelWarn, msg, attrs...)
+	}}
+}
+
+// applyResponseContentFilterWithStatus runs the per-backend
+// Response-scope content filter, if any. It returns:
+//   - filtered: possibly rewritten response, or nil when no filter is
+//     configured for this backend (callers should treat nil as "no change").
+//   - status:   canonical FilterStatus; always populated so callers can
+//     emit the X-Content-Filter-Status header and the
+//     mcp_filter_status_total counter even on the no-filter branch
+//     (FilterStatusOff).
+//   - err:      non-nil on filter rejection or fail-closed failure. Callers
+//     should write a JSON-RPC error and stop forwarding the response.
+func (m *mcpRequestContext) applyResponseContentFilterWithStatus(
+	ctx context.Context,
+	routeName filterapi.MCPRouteName,
+	backendName filterapi.MCPBackendName,
+	req *jsonrpc.Request,
+	resp *jsonrpc.Response,
+) (*jsonrpc.Response, FilterStatus, error) {
+	route := m.routes[routeName]
+	if route == nil {
+		return nil, FilterStatusOff, nil
+	}
+	cf := route.contentFilters[backendName]
+	if cf == nil || !cf.invokeOnResponse {
+		return nil, FilterStatusOff, nil
+	}
+	tool := ""
+	if req != nil && req.Method == "tools/call" && len(req.Params) > 0 {
+		var p mcp.CallToolParams
+		if err := json.Unmarshal(req.Params, &p); err == nil {
+			tool = p.Name
+		}
+	}
+	headers := m.requestHeaders
+	return applyContentFilterOnResponseWithStatus(ctx, m.contentFilterLogger(), &m.client, cf,
+		routeName, backendName, tool, req, resp, headers)
+}
+
+// emitStashedFilterStatus writes the X-Content-Filter-Status header AND
+// records the mcp_filter_status_total counter using the stashed
+// Request- or Response-scope outcome on m. If no scope filter fired
+// during the request, this is a no-op — we do not advertise a header
+// value for pipelines that have no filter configured, matching pre-L04
+// behavior for backends with no filter at all.
+//
+// This method is safe to call multiple times; w.Header().Set is
+// idempotent on the same value, so no duplicate emissions.
+func (m *mcpRequestContext) emitStashedFilterStatus(w http.ResponseWriter) {
+	if m == nil {
+		return
+	}
+	if m.reqScopeFilterStatus == "" {
+		return
+	}
+	writeFilterStatus(w, m.reqScopeFilterRoute, m.reqScopeFilterBackend, m.reqScopeFilterStatus)
+}
+
+// writeJSONRPCErrorResponse writes a JSON-RPC error response to the client.
+// It is used when the content filter blocks a request/response; the HTTP
+// status stays 200 so that MCP clients treat the result as a normal JSON-RPC
+// error rather than a transport failure.
+func writeJSONRPCErrorResponse(w http.ResponseWriter, id jsonrpc.ID, code int64, message, detail string) {
+	var dataRaw []byte
+	if detail != "" {
+		dataRaw, _ = json.Marshal(detail)
+	}
+	errObj := &jsonrpc.Error{Code: code, Message: message, Data: dataRaw}
+	resp := &jsonrpc.Response{ID: id, Error: errObj}
+	body, err := jsonrpc.EncodeMessage(resp)
+	if err != nil {
+		onErrorResponse(w, http.StatusInternalServerError, "failed to encode JSON-RPC error response")
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", len(body)))
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(body)
 }

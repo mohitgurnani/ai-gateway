@@ -136,7 +136,15 @@ func parseAndValidateFlags(args []string) (extProcFlags, error) {
 		"Optional fallback seed used for MCP session key rotation.")
 	fs.IntVar(&flags.mcpFallbackSessionEncryptionIterations, "mcpFallbackSessionEncryptionIterations", 100_000,
 		"Number of iterations used in the fallback PBKDF2 key derivation for MCP session encryption.")
-	fs.DurationVar(&flags.mcpWriteTimeout, "mcpWriteTimeout", 120*time.Second,
+	mcpWriteTimeout := 120 * time.Second
+	if value := os.Getenv("MCP_PROXY_WRITE_TIMEOUT"); value != "" {
+		var err error
+		mcpWriteTimeout, err = time.ParseDuration(value)
+		if err != nil {
+			return extProcFlags{}, fmt.Errorf("invalid MCP_PROXY_WRITE_TIMEOUT: %w", err)
+		}
+	}
+	fs.DurationVar(&flags.mcpWriteTimeout, "mcpWriteTimeout", mcpWriteTimeout,
 		"The maximum duration before timing out writes of the MCP response")
 
 	if err := fs.Parse(args); err != nil {
